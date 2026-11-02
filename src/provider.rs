@@ -8,7 +8,7 @@ use certval::{
     VerifySignatureMessage,
 };
 use der::asn1::BitString;
-use log::debug;
+use log::{debug, trace};
 use spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
 
 /// A [`certval`] crypto provider backed by Windows CNG.
@@ -82,14 +82,14 @@ impl CngCrypto {
         match cng::verify(&key, scheme.padding, scheme.hash, digest, &signature) {
             // CNG verified the signature.
             Verdict::Valid => {
-                debug!("CNG verified a signature");
+                trace!("CNG verified a signature");
                 Ok(())
             }
 
             // CNG reached a verdict and it was negative. The environment treats this as final and
             // consults no other implementation.
             Verdict::Invalid => {
-                debug!("CNG rejected a signature");
+                trace!("CNG rejected a signature");
                 Err(certval::Error::PathValidation(
                     PathValidationStatus::SignatureVerificationFailure,
                 ))
