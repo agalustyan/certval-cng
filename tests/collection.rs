@@ -66,6 +66,8 @@ fn run_family(family: &str, dir_var: &str) -> usize {
         digest.disagreements, digest.pairs
     );
 
+    assert_compared(family, &message, &digest);
+
     message.module_answered + digest.module_answered
 }
 
@@ -88,6 +90,10 @@ fn pss_platform_agrees_with_software() {
 /// reaches software and the verdicts still agree.
 #[test]
 fn ml_dsa_falls_through_to_software() {
+    if !cfg!(feature = "pqc") {
+        println!("ML-DSA: skipped, built without pqc, so certval's software has no verdict to compare against");
+        return;
+    }
     let answered = run_family("ML-DSA", MLDSA_CERTS);
     assert_eq!(answered, 0, "the provider answered an ML-DSA verification");
 }
