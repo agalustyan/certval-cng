@@ -81,13 +81,19 @@ impl CngCrypto {
 
         match cng::verify(&key, scheme.padding, scheme.hash, digest, &signature) {
             // CNG verified the signature.
-            Verdict::Valid => Ok(()),
+            Verdict::Valid => {
+                debug!("CNG verified a signature");
+                Ok(())
+            }
 
             // CNG reached a verdict and it was negative. The environment treats this as final and
             // consults no other implementation.
-            Verdict::Invalid => Err(certval::Error::PathValidation(
-                PathValidationStatus::SignatureVerificationFailure,
-            )),
+            Verdict::Invalid => {
+                debug!("CNG rejected a signature");
+                Err(certval::Error::PathValidation(
+                    PathValidationStatus::SignatureVerificationFailure,
+                ))
+            }
 
             // Any other status is CNG declining the request rather than judging the signature,
             // so another implementation answers.
