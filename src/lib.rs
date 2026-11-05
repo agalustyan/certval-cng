@@ -66,11 +66,16 @@
 mod algorithm;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod blob;
+#[cfg(all(windows, feature = "cms"))]
+#[allow(unsafe_code)]
+mod cms;
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod cng;
 #[cfg(windows)]
 mod provider;
 
+#[cfg(all(windows, feature = "cms"))]
+pub use self::cms::{import_pkcs8, CertStoreIdentities, CngRecipientKey, CngSigningKey};
 #[cfg(windows)]
 pub use provider::CngCrypto;

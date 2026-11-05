@@ -22,6 +22,9 @@ default = []
 # declines ML-DSA, but without it the ML-DSA collection test has no software verdict to compare
 # against and every pair is "no opinion".
 pqc = ["certval/pqc"]
+# Implements certval-cms's content encryption and decryption and key transport by BCrypt, and
+# recipient and signing credentials over NCrypt keys, including those in the certificate store.
+cms = ["dep:certval-cms", "dep:cms", "dep:x509-cert", "dep:zeroize"]
 
 [dependencies]
 certval = { version = "0.2.0-rc.1", default-features = false }
@@ -32,6 +35,12 @@ spki = "0.8.0"
 
 log = "0.4.33"
 
+# Under the `cms` feature.
+certval-cms = { version = "0.1.0-rc.1", optional = true }
+cms = { version = "0.3.0-rc.0", optional = true }
+x509-cert = { version = "0.3.0", default-features = false, optional = true }
+zeroize = { version = "1.8.1", optional = true }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
 
@@ -39,12 +48,19 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Secur
 # certval's software RSA, which the tests compare this provider's verdicts against. A dev-dependency,
 # so the application, not this crate, decides which algorithms certval's software offers.
 certval = { version = "0.2.0-rc.1", default-features = false, features = ["rsa"] }
-x509-cert = { version = "0.3.0", features = ["hazmat"] }
-p256 = { version = "0.14.0", features = ["ecdsa"] }
-p384 = { version = "0.14.0", features = ["ecdsa"] }
-p521 = { version = "0.14.0", features = ["ecdsa"] }
+x509-cert = { version = "0.3.0", features = ["builder", "hazmat"] }
+p256 = { version = "0.14.0", features = ["ecdh", "ecdsa", "pkcs8"] }
+p384 = { version = "0.14.0", features = ["ecdh", "ecdsa", "pkcs8"] }
+p521 = { version = "0.14.0", features = ["ecdh", "ecdsa", "pkcs8"] }
+sha1 = "0.11.0"
 sha2 = "0.11.0"
 signature = "3.0.0"
+# The cms tests: keys generated in software and imported into CNG, recipient identifiers, and the
+# random number generator certval-cms's builders take.
+rsa = { version = "=0.10.0-rc.19", features = ["encoding"] }
+elliptic-curve = { version = "0.14.3", features = ["arithmetic"] }
+getrandom = { version = "0.4.1", features = ["sys_rng"] }
+rand_core = "0.10.1"
 
 [package.metadata.docs.rs]
 # The provider exists only on Windows.
@@ -53,8 +69,11 @@ targets = ["x86_64-pc-windows-msvc"]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
+[patch.crates-io]
+# certval-cms is not on crates.io yet, so the `cms` feature takes it from the neighboring checkout.
+# Remove this once it publishes.
+certval-cms = { path = "../certval-cms" }
 # Uncomment while developing certval and this crate together: it redirects the crates.io dependency
 # above to the local checkout, so edits take effect without a publish. Leave it commented on anything
 # that is committed, or the build depends on a path that only exists here.
-# [patch.crates-io]
 # certval = { path = "../rust-pki/certval" }

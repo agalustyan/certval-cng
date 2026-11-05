@@ -1,0 +1,378 @@
+//! CMS through this provider, crossed with certval-cms's RustCrypto software in both directions.
+//! Keys are generated in software and imported into the Microsoft Software Key Storage Provider,
+//! so that both hold the same key.
+//!
+//! Enveloping: messages software builds are decrypted with only this provider registered and a
+//! `CngRecipientKey`, and messages this provider builds are decrypted by software. Every key
+//! transport algorithm with AES-CBC and AES-GCM content, and ECDH on P-256, P-384 and P-521 with each
+//! KDF hash, wrap and user keying material.
+//!
+//! Signing: messages a `CngSigningKey` signs, a digest at a time, are verified by software, and
+//! messages software signs are verified, and hashed, by this provider alone.
+
+#![cfg(all(windows, feature = "cms"))]
+
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use certval::PkiEnvironment;
+use certval_cms::{
+    rsa_pss, CmsEnvironment, ContentEncryptionAlgorithm, DigestAlgorithm, EnvelopedDataBuilder,
+    Error, KeyAgreeRecipient, KeyAgreementAlgorithm, KeyTransRecipient, KeyTransportAlgorithm,
+    KeyWrapAlgorithm, RecipientCredential, SignedDataBuilder, Signer, SignerPolicy,
+    SigningCredential, SoftwareRecipientKey, SoftwareSigningKey,
+};
+use certval_cng::{import_pkcs8, CngCrypto};
+use cms::content_info::ContentInfo;
+use const_oid::db::rfc5912::ID_CE_SUBJECT_KEY_IDENTIFIER;
+use der::{asn1::OctetString, Decode, Encode};
+use elliptic_curve::Generate as _;
+use getrandom::SysRng;
+use p256::pkcs8::{EncodePrivateKey, EncodePublicKey};
+use rand_core::UnwrapErr;
+use sha1::{Digest, Sha1};
+use spki::{SubjectPublicKeyInfoOwned, SubjectPublicKeyInfoRef};
+use x509_cert::{
+    builder::{profile::BuilderProfile, Builder, CertificateBuilder},
+    ext::{pkix::SubjectKeyIdentifier, Extension},
+    name::Name,
+    serial_number::SerialNumber,
+    time::Validity,
+    Certificate, TbsCertificate,
+};
+
+type Rng = UnwrapErr<SysRng>;
+
+const MESSAGE: &[u8] = b"certval-cng, longer than one AES block so that padding is exercised";
+
+const CONTENT: [ContentEncryptionAlgorithm; 6] = [
+    ContentEncryptionAlgorithm::Aes128Cbc,
+    ContentEncryptionAlgorithm::Aes192Cbc,
+    ContentEncryptionAlgorithm::Aes256Cbc,
+    ContentEncryptionAlgorithm::Aes128Gcm,
+    ContentEncryptionAlgorithm::Aes192Gcm,
+    ContentEncryptionAlgorithm::Aes256Gcm,
+];
+
+const WRAPS: [KeyWrapAlgorithm; 3] = [
+    KeyWrapAlgorithm::Aes128,
+    KeyWrapAlgorithm::Aes192,
+    KeyWrapAlgorithm::Aes256,
+];
+
+const DIGESTS: [DigestAlgorithm; 3] = [
+    DigestAlgorithm::Sha256,
+    DigestAlgorithm::Sha384,
+    DigestAlgorithm::Sha512,
+];
+
+fn rng() -> Rng {
+    UnwrapErr(SysRng)
+}
+
+/// RustCrypto for everything, over a PkiEnvironment of certval's software.
+fn software() -> CmsEnvironment {
+    let mut pe = PkiEnvironment::default();
+    pe.populate_5280_pki_environment();
+    let mut env = CmsEnvironment::new();
+    env.populate_software();
+    env.set_pki_environment(Arc::new(pe));
+    env
+}
+
+/// This provider for everything it implements, with nothing to fall back to, over a PkiEnvironment
+/// holding only this provider.
+fn cng() -> CmsEnvironment {
+    let mut pe = PkiEnvironment::default();
+    pe.add_calculate_hash_callback(CngCrypto::new());
+    pe.add_verify_signature_message_callback(CngCrypto::new());
+    pe.add_verify_signature_digest_callback(CngCrypto::new());
+    let mut env = CmsEnvironment::new();
+    env.set_pki_environment(Arc::new(pe));
+    env.add_encrypt_content_callback(CngCrypto::new());
+    env.add_decrypt_content_callback(CngCrypto::new());
+    env.add_encrypt_key_transport_callback(CngCrypto::new());
+    env.add_encrypt_key_agreement_callback(CngCrypto::new());
+    env
+}
+
+/// Issues certificates with a subject key identifier from a throwaway P-256 CA.
+struct Profile;
+
+impl BuilderProfile for Profile {
+    fn get_issuer(&self, _subject: &Name) -> Name {
+        Name::from_str("CN=certval-cng test CA").unwrap()
+    }
+    fn get_subject(&self) -> Name {
+        Name::from_str("CN=certval-cng test").unwrap()
+    }
+    fn build_extensions(
+        &self,
+        spk: SubjectPublicKeyInfoRef<'_>,
+        _issuer_spk: SubjectPublicKeyInfoRef<'_>,
+        _tbs: &TbsCertificate,
+    ) -> x509_cert::builder::Result<Vec<Extension>> {
+        let skid = SubjectKeyIdentifier(
+            OctetString::new(Sha1::digest(spk.subject_public_key.raw_bytes()).to_vec()).unwrap(),
+        );
+        Ok(vec![Extension {
+            extn_id: ID_CE_SUBJECT_KEY_IDENTIFIER,
+            critical: false,
+            extn_value: OctetString::new(skid.to_der().unwrap()).unwrap(),
+        }])
+    }
+}
+
+fn certificate(spki_der: &[u8]) -> Certificate {
+    let ca = p256::ecdsa::SigningKey::from_slice(&[9u8; 32]).unwrap();
+    CertificateBuilder::new(
+        Profile,
+        SerialNumber::new(&[1]).unwrap(),
+        Validity::from_now(Duration::from_secs(3600)).unwrap(),
+        SubjectPublicKeyInfoOwned::from_der(spki_der).unwrap(),
+    )
+    .unwrap()
+    .build::<_, p256::ecdsa::DerSignature>(&ca)
+    .unwrap()
+}
+
+/// A key generated in software, its certificate, and the key as PKCS #8.
+struct Key {
+    cert: Certificate,
+    pkcs8: Vec<u8>,
+}
+
+impl Key {
+    fn rsa() -> Self {
+        let key = rsa::RsaPrivateKey::new(&mut rng(), 2048).unwrap();
+        let spki = key.to_public_key().to_public_key_der().unwrap();
+        Self {
+            cert: certificate(spki.as_bytes()),
+            pkcs8: key.to_pkcs8_der().unwrap().as_bytes().to_vec(),
+        }
+    }
+}
+
+macro_rules! ec_key {
+    ($curve:ident) => {{
+        let key = $curve::SecretKey::generate_from_rng(&mut rng());
+        let spki = key.public_key().to_public_key_der().unwrap();
+        Key {
+            cert: certificate(spki.as_bytes()),
+            pkcs8: key.to_pkcs8_der().unwrap().as_bytes().to_vec(),
+        }
+    }};
+}
+
+fn envelop<'e>(
+    env: &'e CmsEnvironment,
+    alg: ContentEncryptionAlgorithm,
+    recipient: impl cms::builder::RecipientInfoBuilder<Rng = Rng> + 'e,
+) -> ContentInfo {
+    if alg.is_authenticated() {
+        certval_cms::AuthEnvelopedDataBuilder::new(MESSAGE, alg)
+            .unwrap()
+            .add_recipient(recipient)
+            .build_content_info(env, &mut rng())
+            .unwrap_or_else(|e| panic!("building: {e}"))
+    } else {
+        EnvelopedDataBuilder::new(MESSAGE, alg)
+            .unwrap()
+            .add_recipient(recipient)
+            .build_content_info(env, &mut rng())
+            .unwrap_or_else(|e| panic!("building: {e}"))
+    }
+}
+
+fn assert_decrypts(
+    env: &CmsEnvironment,
+    ci: &ContentInfo,
+    credential: &dyn RecipientCredential,
+    name: &str,
+) {
+    let decrypted = env
+        .decrypt_enveloped_data(ci, Some(credential))
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
+    assert_eq!(decrypted.content.as_slice(), MESSAGE, "{name}");
+}
+
+#[test]
+fn key_transport_with_each_algorithm_and_content_encryption() {
+    let (software, platform) = (software(), cng());
+    let key = Key::rsa();
+    let (platform_key, _) = import_pkcs8(key.cert.clone(), &key.pkcs8).unwrap();
+    let software_key = SoftwareRecipientKey::from_pkcs8_der(key.cert.clone(), &key.pkcs8).unwrap();
+    for alg in [
+        KeyTransportAlgorithm::RsaPkcs1v15,
+        KeyTransportAlgorithm::RsaOaepSha1,
+        KeyTransportAlgorithm::RsaOaepSha256,
+        KeyTransportAlgorithm::RsaOaepSha384,
+        KeyTransportAlgorithm::RsaOaepSha512,
+    ] {
+        for content in CONTENT {
+            let name = format!("{alg:?} {content:?}");
+            let r = KeyTransRecipient::from_certificate(&software, &key.cert, None, alg).unwrap();
+            let ci = envelop(&software, content, r);
+            assert_decrypts(
+                &platform,
+                &ci,
+                &platform_key,
+                &format!("software to CNG, {name}"),
+            );
+
+            let r = KeyTransRecipient::from_certificate(&platform, &key.cert, None, alg).unwrap();
+            let ci = envelop(&platform, content, r);
+            assert_decrypts(
+                &software,
+                &ci,
+                &software_key,
+                &format!("CNG to software, {name}"),
+            );
+        }
+    }
+}
+
+fn key_agreement(key: Key, curve: &str) {
+    let (software, platform) = (software(), cng());
+    let (platform_key, _) = import_pkcs8(key.cert.clone(), &key.pkcs8).unwrap();
+    let software_key = SoftwareRecipientKey::from_pkcs8_der(key.cert.clone(), &key.pkcs8).unwrap();
+    for alg in [
+        KeyAgreementAlgorithm::EcdhSha256,
+        KeyAgreementAlgorithm::EcdhSha384,
+        KeyAgreementAlgorithm::EcdhSha512,
+    ] {
+        for wrap in WRAPS {
+            for ukm in [None, Some(b"user keying material".to_vec())] {
+                let name = format!("{curve} {alg:?} {wrap:?} ukm={}", ukm.is_some());
+                let r = KeyAgreeRecipient::from_certificate(
+                    &software,
+                    &key.cert,
+                    None,
+                    alg,
+                    wrap,
+                    ukm.clone(),
+                )
+                .unwrap();
+                let ci = envelop(&software, ContentEncryptionAlgorithm::Aes256Gcm, r);
+                assert_decrypts(
+                    &platform,
+                    &ci,
+                    &platform_key,
+                    &format!("software to CNG, {name}"),
+                );
+
+                let r =
+                    KeyAgreeRecipient::from_certificate(&platform, &key.cert, None, alg, wrap, ukm)
+                        .unwrap();
+                let ci = envelop(&platform, ContentEncryptionAlgorithm::Aes128Cbc, r);
+                assert_decrypts(
+                    &software,
+                    &ci,
+                    &software_key,
+                    &format!("CNG to software, {name}"),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn key_agreement_on_p256() {
+    key_agreement(ec_key!(p256), "P-256");
+}
+
+#[test]
+fn key_agreement_on_p384() {
+    key_agreement(ec_key!(p384), "P-384");
+}
+
+#[test]
+fn key_agreement_on_p521() {
+    key_agreement(ec_key!(p521), "P-521");
+}
+
+fn assert_signs_across(
+    signing: &CmsEnvironment,
+    verifying: &CmsEnvironment,
+    credential: &dyn SigningCredential,
+    configure: impl Fn(Signer<'_>) -> Signer<'_>,
+    name: &str,
+) {
+    let ci = SignedDataBuilder::new(MESSAGE)
+        .add_signer(configure(Signer::explicit(credential)))
+        .build(signing)
+        .unwrap_or_else(|e| panic!("{name}: signing: {e}"))
+        .content_info;
+    let verified = verifying
+        .verify_signed_data(&ci, None, None, SignerPolicy::All)
+        .unwrap_or_else(|e| panic!("{name}: verifying: {e}"));
+    assert_eq!(verified.content, MESSAGE, "{name}");
+}
+
+fn sign_both_ways(key: &Key, configure: impl Fn(Signer<'_>) -> Signer<'_> + Copy, name: &str) {
+    let (software, platform) = (software(), cng());
+    let (_, platform_key) = import_pkcs8(key.cert.clone(), &key.pkcs8).unwrap();
+    let software_key = SoftwareSigningKey::from_pkcs8_der(key.cert.clone(), &key.pkcs8).unwrap();
+    assert_signs_across(
+        &platform,
+        &software,
+        &platform_key,
+        configure,
+        &format!("CNG signs, software verifies: {name}"),
+    );
+    assert_signs_across(
+        &software,
+        &platform,
+        &software_key,
+        configure,
+        &format!("software signs, CNG verifies: {name}"),
+    );
+}
+
+#[test]
+fn rsa_pkcs1v15_and_pss_with_each_digest() {
+    let key = Key::rsa();
+    for digest in DIGESTS {
+        sign_both_ways(
+            &key,
+            |s| s.digest(digest),
+            &format!("PKCS #1 v1.5 {digest:?}"),
+        );
+        sign_both_ways(
+            &key,
+            |s| {
+                s.digest(digest)
+                    .signature_algorithm(rsa_pss(digest).unwrap())
+            },
+            &format!("PSS {digest:?}"),
+        );
+    }
+}
+
+#[test]
+fn ecdsa_on_each_curve_with_each_digest() {
+    for (key, curve) in [
+        (ec_key!(p256), "P-256"),
+        (ec_key!(p384), "P-384"),
+        (ec_key!(p521), "P-521"),
+    ] {
+        for digest in DIGESTS {
+            sign_both_ways(&key, |s| s.digest(digest), &format!("{curve} {digest:?}"));
+        }
+    }
+}
+
+#[test]
+fn aes_gcm_and_cbc_are_both_performed() {
+    let platform = cng();
+    for alg in CONTENT {
+        assert!(
+            !matches!(
+                platform.encrypt_content(alg, MESSAGE, None),
+                Err(Error::Unrecognized)
+            ),
+            "{alg:?}"
+        );
+    }
+}
