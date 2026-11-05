@@ -917,6 +917,12 @@ impl CertStoreIdentities {
         unsafe { CertCloseStore(store, 0) };
         Ok(found)
     }
+
+    /// Every certificate in the store with an NCrypt private key, for a caller to list or choose
+    /// among. A credential for one is found through either source interface, by its identifier.
+    pub fn certificates(&self) -> Result<Vec<Certificate>> {
+        Ok(self.find(|_| true)?.into_iter().map(|(c, _)| c).collect())
+    }
 }
 
 impl RecipientCredentialSource for CertStoreIdentities {

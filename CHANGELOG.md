@@ -6,10 +6,10 @@ an increase to the minimum supported Rust version is not treated as a breaking c
 
 A `cms` feature implements certval-cms's AES-CBC and AES-GCM content encryption and decryption and
 RSA key transport by BCrypt, with `CngRecipientKey` and `CngSigningKey` decrypting and signing with
-NCrypt keys, `CertStoreIdentities` finding them in the current user's certificate store, and
-`import_pkcs8` importing a key into the Microsoft Software Key Storage Provider. Key agreement uses
-CNG's ECDH and certval-cms's X9.63 KDF and key wrap, CNG having no X9.63 KDF. Not yet run
-on Windows.
+NCrypt keys, `CertStoreIdentities` finding them in the current user's certificate store and
+listing them with `certificates()`, and `import_pkcs8` importing a key into the Microsoft Software
+Key Storage Provider. Key agreement uses CNG's ECDH and certval-cms's X9.63 KDF and key wrap, CNG
+having no X9.63 KDF.
 
 ## [0.1.0-rc.1] - 2026-10-31
 
