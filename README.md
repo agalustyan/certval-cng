@@ -86,6 +86,28 @@ Three encoding differences between X.509 and CNG are bridged internally:
   `BCRYPT_ECCPUBLIC_BLOB` names the curve in its header's magic number;
 - an ECDSA signature travels as `SEQUENCE { r, s }`, while CNG uses fixed-width `r‖s`.
 
+## CMS
+
+With the `cms` feature, `CngCrypto` also implements
+[certval-cms](https://github.com/carl-wallace/certval-cms)'s content encryption and decryption and
+key transport, and NCrypt keys serve as credentials: `CngRecipientKey` decrypts, `CngSigningKey`
+signs, and `CertStoreIdentities` finds both in the current user's personal certificate store, where
+CAPI and virtual smart card keys are: a decryption key by the recipient identifier a message
+contains, and signing keys by signer identifier, email address or subject.
+`import_pkcs8` makes both for a key imported into the Microsoft Software Key Storage Provider.
+
+| Operation | Coverage |
+|---|---|
+| Content encryption and decryption | AES-128/192/256 in CBC and GCM, by BCrypt |
+| Key transport | RSAES-PKCS1-v1_5, RSAES-OAEP with SHA-1/256/384/512, by `BCryptEncrypt` and `NCryptDecrypt` |
+| Key agreement | ECDH on P-256, P-384 and P-521, by `BCryptSecretAgreement` to encrypt and `NCryptSecretAgreement` to decrypt; the X9.63 KDF and AES key wrap by certval-cms |
+| Signing | RSA PKCS #1 v1.5 and RSASSA-PSS, and ECDSA, by `NCryptSignHash`, over a digest the environment computes |
+| KEM | declined |
+
+CNG has no X9.63 KDF, so for key agreement CNG returns the shared secret (`BCRYPT_KDF_RAW_SECRET`),
+and certval-cms's `wrap_with_ecdh_secret` wraps the content-encryption key or `cek_from_ecdh_secret`
+recovers it; the private key stays in its store.
+
 ## Testing
 
 `cargo test` runs on any platform; off Windows it runs only the portable unit tests (the algorithm
@@ -124,6 +146,13 @@ Run in CI on GitHub's hosted Windows runner against rust-pki's PKITS collections
 389 RSA and 388 ECDSA verifications that software accepted, and both RSASSA-PSS ones, with no
 disagreements in either interface, and declined every ML-DSA one. Changed messages and changed
 signatures were rejections, not refusals. The runner was not in FIPS-approved mode.
+
+The `cms` feature has been type-checked for Windows but not yet run; its tests run first in Windows
+CI.
+
+certval-cms is not on crates.io yet, so `Cargo.toml`'s `[patch.crates-io]` takes it from a
+neighboring checkout (`../certval-cms`), and CI checks it out there. Both go when it publishes, and
+this crate cannot publish before it does.
 
 certval is consumed from crates.io. A commented `[patch.crates-io]` line in `Cargo.toml` redirects
 the dependency to a local checkout for developing both crates together.

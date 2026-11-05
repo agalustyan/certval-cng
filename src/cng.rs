@@ -32,7 +32,7 @@ fn hash_handle(hash: Hash) -> BCRYPT_ALG_HANDLE {
     }
 }
 
-fn hash_name(hash: Hash) -> PCWSTR {
+pub(crate) fn hash_name(hash: Hash) -> PCWSTR {
     match hash {
         Hash::Sha1 => BCRYPT_SHA1_ALGORITHM,
         Hash::Sha256 => BCRYPT_SHA256_ALGORITHM,
@@ -69,6 +69,14 @@ pub(crate) fn hash(hash: Hash, data: &[u8]) -> Option<Vec<u8>> {
 
 /// An imported public key, destroyed when dropped.
 pub(crate) struct Key(BCRYPT_KEY_HANDLE);
+
+impl Key {
+    /// The BCrypt handle, live while the key is.
+    #[cfg(feature = "cms")]
+    pub(crate) fn handle(&self) -> BCRYPT_KEY_HANDLE {
+        self.0
+    }
+}
 
 impl Drop for Key {
     fn drop(&mut self) {
