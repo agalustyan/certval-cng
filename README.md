@@ -96,6 +96,12 @@ CAPI and virtual smart card keys are: a decryption key by the recipient identifi
 contains, and signing keys by signer identifier, email address or subject, and `certificates()`
 lists them. `import_pkcs8` makes both for a key imported into the Microsoft Software Key Storage Provider.
 
+A key with no certificate yet, e.g. one signing its own certificate request or a self-signed
+certificate, is certval-cms's `SigningKey`: `CngKey`, which `import_pkcs8_key` makes from a PKCS #8
+RSA or EC key imported into the same provider. It signs as `CngSigningKey` does, and its public key
+is the one CNG exports for it, so an EC key need not carry its public key. An ML-DSA key is
+declined.
+
 | Operation | Coverage |
 |---|---|
 | Content encryption and decryption | AES-128/192/256 in CBC and GCM, by BCrypt |

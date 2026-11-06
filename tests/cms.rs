@@ -8,7 +8,8 @@
 //! KDF hash, wrap and user keying material.
 //!
 //! Signing: messages a `CngSigningKey` signs, a digest at a time, are verified by software, and
-//! messages software signs are verified, and hashed, by this provider alone.
+//! messages software signs are verified, and hashed, by this provider alone. A `CngKey`, with no
+//! certificate, signs its own certificate request, which software verifies.
 
 #![cfg(all(windows, feature = "cms"))]
 
@@ -359,6 +360,75 @@ fn ecdsa_on_each_curve_with_each_digest() {
     ] {
         for digest in DIGESTS {
             sign_both_ways(&key, |s| s.digest(digest), &format!("{curve} {digest:?}"));
+        }
+    }
+}
+
+// ---- keys without certificates
+
+/// A key with no certificate signs its own certificate request through x509-cert's builder, with
+/// only this provider registered, and software verifies it with the key's public key, which is the
+/// one the request carries.
+fn signs_its_request(
+    key: &dyn certval_cms::SigningKey,
+    digest: DigestAlgorithm,
+    pss: bool,
+    name: &str,
+) {
+    use certval_cms::{CredentialSignature, CredentialSigner};
+    use x509_cert::request::RequestBuilder;
+    let platform = cng();
+    let signer = if pss {
+        CredentialSigner::with_algorithm(&platform, key, digest, rsa_pss(digest).unwrap())
+    } else {
+        CredentialSigner::new(&platform, key, digest).unwrap_or_else(|e| panic!("{name}: {e}"))
+    };
+    let request = RequestBuilder::new(Name::from_str("CN=certval-cng request").unwrap())
+        .unwrap()
+        .build::<_, CredentialSignature>(&signer)
+        .unwrap_or_else(|e| panic!("{name}: signing the request: {e}"));
+    assert_eq!(&request.info.public_key, key.public_key(), "{name}");
+    let software = software();
+    let pe = software.pki_environment().unwrap();
+    pe.verify_signature_message(
+        pe,
+        &request.info.to_der().unwrap(),
+        &request.signature,
+        &request.algorithm,
+        &request.info.public_key,
+    )
+    .unwrap_or_else(|e| panic!("{name}: verifying the request: {e:?}"));
+}
+
+#[test]
+fn imported_keys_without_certificates_sign_requests() {
+    use certval_cms::SigningKey;
+    use certval_cng::import_pkcs8_key;
+    let rsa = Key::rsa();
+    let key = import_pkcs8_key(&rsa.pkcs8).unwrap();
+    // The public key CNG exports is the one the certificate carries.
+    assert_eq!(
+        key.public_key(),
+        rsa.cert.tbs_certificate().subject_public_key_info(),
+        "RSA"
+    );
+    for digest in DIGESTS {
+        signs_its_request(&key, digest, false, &format!("RSA PKCS #1 v1.5 {digest:?}"));
+        signs_its_request(&key, digest, true, &format!("RSA PSS {digest:?}"));
+    }
+    for (ec, curve) in [
+        (ec_key!(p256), "P-256"),
+        (ec_key!(p384), "P-384"),
+        (ec_key!(p521), "P-521"),
+    ] {
+        let key = import_pkcs8_key(&ec.pkcs8).unwrap();
+        assert_eq!(
+            key.public_key(),
+            ec.cert.tbs_certificate().subject_public_key_info(),
+            "{curve}"
+        );
+        for digest in DIGESTS {
+            signs_its_request(&key, digest, false, &format!("{curve} {digest:?}"));
         }
     }
 }

@@ -17,6 +17,7 @@ use certval_cms::{
     KeyAgreeOutput, KeyAgreementAlgorithm, KeyTransportAlgorithm, KeyWrapAlgorithm,
     RecipientCredential, RecipientCredentialSource, Result, SharedRecipientCredential,
     SharedSigningCredential, SigningCredential, SigningCredentialLookup, SigningCredentialSource,
+    SigningKey,
 };
 use cms::enveloped_data::RecipientIdentifier;
 use const_oid::db::rfc5912::{ID_EC_PUBLIC_KEY, RSA_ENCRYPTION};
@@ -30,21 +31,24 @@ use windows_sys::core::{w, PCWSTR};
 use windows_sys::Win32::Security::Cryptography::{
     BCryptDecrypt, BCryptDestroyKey, BCryptEncrypt, BCryptGenRandom, BCryptGenerateSymmetricKey,
     CertCloseStore, CertEnumCertificatesInStore, CertOpenSystemStoreW,
-    CryptAcquireCertificatePrivateKey, NCryptDecrypt, NCryptDeriveKey, NCryptFreeObject,
-    NCryptGetProperty, NCryptImportKey, NCryptSecretAgreement, NCryptSignHash,
+    CryptAcquireCertificatePrivateKey, NCryptDecrypt, NCryptDeriveKey, NCryptExportKey,
+    NCryptFreeObject, NCryptGetProperty, NCryptImportKey, NCryptSecretAgreement, NCryptSignHash,
     BCRYPT_AES_CBC_ALG_HANDLE, BCRYPT_AES_GCM_ALG_HANDLE, BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO,
     BCRYPT_BLOCK_PADDING, BCRYPT_ECCPUBLIC_BLOB, BCRYPT_ECDH_PUBLIC_P256_MAGIC,
     BCRYPT_ECDH_PUBLIC_P384_MAGIC, BCRYPT_ECDH_PUBLIC_P521_MAGIC, BCRYPT_KDF_RAW_SECRET,
     BCRYPT_KEY_HANDLE, BCRYPT_OAEP_PADDING_INFO, BCRYPT_PAD_OAEP, BCRYPT_PAD_PKCS1, BCRYPT_PAD_PSS,
-    BCRYPT_PKCS1_PADDING_INFO, BCRYPT_PSS_PADDING_INFO, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-    CERT_CONTEXT, CERT_NCRYPT_KEY_SPEC, CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG, NCRYPT_KEY_HANDLE,
-    NCRYPT_PROVIDER_HANDLE_PROPERTY, NCRYPT_PROV_HANDLE, NCRYPT_SECRET_HANDLE,
+    BCRYPT_PKCS1_PADDING_INFO, BCRYPT_PSS_PADDING_INFO, BCRYPT_RSAPUBLIC_BLOB,
+    BCRYPT_USE_SYSTEM_PREFERRED_RNG, CERT_CONTEXT, CERT_NCRYPT_KEY_SPEC,
+    CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG, NCRYPT_KEY_HANDLE, NCRYPT_PROVIDER_HANDLE_PROPERTY,
+    NCRYPT_PROV_HANDLE, NCRYPT_SECRET_HANDLE,
 };
 use x509_cert::Certificate;
 use zeroize::Zeroizing;
 
 use crate::algorithm::{signature_scheme, Hash, Padding};
-use crate::blob::{ecc_public_blob, rsa_public_blob, Curve};
+use crate::blob::{
+    ecc_public_blob, ecc_spki_from_blob, rsa_public_blob, rsa_spki_from_blob, Curve,
+};
 use crate::cng::{hash_name, import_rsa};
 use crate::CngCrypto;
 
@@ -769,79 +773,174 @@ impl SigningCredential for CngSigningKey {
         alg: &AlgorithmIdentifierOwned,
         digest: &[u8],
     ) -> Result<Vec<u8>> {
-        let Some(scheme) = signature_scheme(alg) else {
-            return Err(Error::Unrecognized);
-        };
-        if digest.len() != scheme.hash.len() {
-            return Err(Error::Unrecognized);
-        }
         let key_alg = self
             .certificate
             .tbs_certificate()
             .subject_public_key_info()
             .algorithm
             .oid;
-        let fits = match scheme.padding {
-            Padding::Pkcs1 | Padding::Pss { .. } => key_alg == RSA_ENCRYPTION,
-            Padding::Ecdsa => key_alg == ID_EC_PUBLIC_KEY,
-        };
-        if !fits {
-            return Err(Error::Unrecognized);
-        }
-        let pkcs1 = BCRYPT_PKCS1_PADDING_INFO {
-            pszAlgId: hash_name(scheme.hash),
-        };
-        let pss = BCRYPT_PSS_PADDING_INFO {
-            pszAlgId: hash_name(scheme.hash),
-            cbSalt: match scheme.padding {
-                Padding::Pss { salt_len } => salt_len,
-                _ => 0,
-            },
-        };
-        let (info, flag): (*const core::ffi::c_void, u32) = match scheme.padding {
-            Padding::Pkcs1 => (
-                (&pkcs1 as *const BCRYPT_PKCS1_PADDING_INFO).cast(),
-                BCRYPT_PAD_PKCS1,
-            ),
-            Padding::Pss { .. } => (
-                (&pss as *const BCRYPT_PSS_PADDING_INFO).cast(),
-                BCRYPT_PAD_PSS,
-            ),
-            Padding::Ecdsa => (std::ptr::null(), 0),
-        };
-        let mut signature = vec![0u8; 1024];
-        let mut written = 0u32;
-        // SAFETY: the key is live, the padding info outlives the call, and NCrypt writes at most
-        // the signature buffer's length, reporting how many octets.
-        let status = unsafe {
-            NCryptSignHash(
-                self.key.0,
-                info,
-                digest.as_ptr(),
-                len32(digest)?,
-                signature.as_mut_ptr(),
-                len32(&signature)?,
-                &mut written,
-                flag,
-            )
-        };
-        if !succeeded(status) {
-            debug!("NCrypt could not sign: {status:#010x}");
-            return Err(Error::Crypto(String::from("signing failed")));
-        }
-        signature.truncate(written as usize);
-        if scheme.padding == Padding::Ecdsa {
-            // CNG gives ECDSA as fixed-width r‖s; CMS carries it DER-encoded.
-            let (r, s) = signature.split_at(signature.len() / 2);
-            signature = EcdsaSignature {
-                r: Uint::new(r)?,
-                s: Uint::new(s)?,
-            }
-            .to_der()?;
-        }
-        trace!("CNG signed with {}", alg.oid);
-        Ok(signature)
+        ncrypt_sign_digest(&self.key, key_alg, alg, digest)
     }
+}
+
+/// A [`SigningKey`] whose private key is an NCrypt key, with no certificate: e.g. a key signing its
+/// own certificate request or a self-signed certificate. It signs as [`CngSigningKey`] does, and
+/// its public key is the one CNG exports for it.
+pub struct CngKey {
+    public_key: SubjectPublicKeyInfoOwned,
+    key: Arc<NcryptKey>,
+}
+
+impl CngKey {
+    /// A key for `key`, its public key read back from CNG: RSA, or EC on P-256, P-384 or P-521.
+    /// Any other key, e.g. ML-DSA, is declined.
+    fn new(key: NcryptKey) -> Result<Self> {
+        let public_key = export_public(&key, BCRYPT_RSAPUBLIC_BLOB)
+            .and_then(|blob| rsa_spki_from_blob(&blob))
+            .or_else(|| {
+                export_public(&key, BCRYPT_ECCPUBLIC_BLOB)
+                    .and_then(|blob| ecc_spki_from_blob(&blob))
+            })
+            .ok_or(Error::Unrecognized)?;
+        Ok(Self {
+            public_key,
+            key: Arc::new(key),
+        })
+    }
+}
+
+impl SigningKey for CngKey {
+    fn public_key(&self) -> &SubjectPublicKeyInfoOwned {
+        &self.public_key
+    }
+
+    fn sign_digest(
+        &self,
+        _env: &CmsEnvironment,
+        alg: &AlgorithmIdentifierOwned,
+        digest: &[u8],
+    ) -> Result<Vec<u8>> {
+        ncrypt_sign_digest(&self.key, self.public_key.algorithm.oid, alg, digest)
+    }
+}
+
+/// The public half of `key` as a `blob_type` blob, or `None` when NCrypt does not export it as
+/// one, e.g. an RSA blob for an EC key.
+fn export_public(key: &NcryptKey, blob_type: PCWSTR) -> Option<Vec<u8>> {
+    let mut len = 0u32;
+    // SAFETY: the key is live; a null output buffer asks only for the length.
+    let status = unsafe {
+        NCryptExportKey(
+            key.0,
+            0,
+            blob_type,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            0,
+            &mut len,
+            0,
+        )
+    };
+    if !succeeded(status) || len == 0 {
+        return None;
+    }
+    let mut blob = vec![0u8; len as usize];
+    // SAFETY: the key is live and the buffer is live with the length passed; NCrypt reports how
+    // many octets it wrote.
+    let status = unsafe {
+        NCryptExportKey(
+            key.0,
+            0,
+            blob_type,
+            std::ptr::null(),
+            blob.as_mut_ptr(),
+            len,
+            &mut len,
+            0,
+        )
+    };
+    if !succeeded(status) {
+        debug!("NCrypt could not export a public key: {status:#010x}");
+        return None;
+    }
+    blob.truncate(len as usize);
+    Some(blob)
+}
+
+/// Signs `digest` with the NCrypt `key`, whose public key is identified as `key_alg`: RSA PKCS #1
+/// v1.5 or RSASSA-PSS, or ECDSA, by `NCryptSignHash`, as `alg` says. Anything else is declined.
+fn ncrypt_sign_digest(
+    key: &NcryptKey,
+    key_alg: const_oid::ObjectIdentifier,
+    alg: &AlgorithmIdentifierOwned,
+    digest: &[u8],
+) -> Result<Vec<u8>> {
+    let Some(scheme) = signature_scheme(alg) else {
+        return Err(Error::Unrecognized);
+    };
+    if digest.len() != scheme.hash.len() {
+        return Err(Error::Unrecognized);
+    }
+    let fits = match scheme.padding {
+        Padding::Pkcs1 | Padding::Pss { .. } => key_alg == RSA_ENCRYPTION,
+        Padding::Ecdsa => key_alg == ID_EC_PUBLIC_KEY,
+    };
+    if !fits {
+        return Err(Error::Unrecognized);
+    }
+    let pkcs1 = BCRYPT_PKCS1_PADDING_INFO {
+        pszAlgId: hash_name(scheme.hash),
+    };
+    let pss = BCRYPT_PSS_PADDING_INFO {
+        pszAlgId: hash_name(scheme.hash),
+        cbSalt: match scheme.padding {
+            Padding::Pss { salt_len } => salt_len,
+            _ => 0,
+        },
+    };
+    let (info, flag): (*const core::ffi::c_void, u32) = match scheme.padding {
+        Padding::Pkcs1 => (
+            (&pkcs1 as *const BCRYPT_PKCS1_PADDING_INFO).cast(),
+            BCRYPT_PAD_PKCS1,
+        ),
+        Padding::Pss { .. } => (
+            (&pss as *const BCRYPT_PSS_PADDING_INFO).cast(),
+            BCRYPT_PAD_PSS,
+        ),
+        Padding::Ecdsa => (std::ptr::null(), 0),
+    };
+    let mut signature = vec![0u8; 1024];
+    let mut written = 0u32;
+    // SAFETY: the key is live, the padding info outlives the call, and NCrypt writes at most the
+    // signature buffer's length, reporting how many octets.
+    let status = unsafe {
+        NCryptSignHash(
+            key.0,
+            info,
+            digest.as_ptr(),
+            len32(digest)?,
+            signature.as_mut_ptr(),
+            len32(&signature)?,
+            &mut written,
+            flag,
+        )
+    };
+    if !succeeded(status) {
+        debug!("NCrypt could not sign: {status:#010x}");
+        return Err(Error::Crypto(String::from("signing failed")));
+    }
+    signature.truncate(written as usize);
+    if scheme.padding == Padding::Ecdsa {
+        // CNG gives ECDSA as fixed-width r‖s; CMS carries it DER-encoded.
+        let (r, s) = signature.split_at(signature.len() / 2);
+        signature = EcdsaSignature {
+            r: Uint::new(r)?,
+            s: Uint::new(s)?,
+        }
+        .to_der()?;
+    }
+    trace!("CNG signed with {}", alg.oid);
+    Ok(signature)
 }
 
 /// The current user's personal certificate store ("MY"), each certificate there with an NCrypt
@@ -969,13 +1068,34 @@ pub fn import_pkcs8(
     certificate: Certificate,
     pkcs8: &[u8],
 ) -> Result<(CngRecipientKey, CngSigningKey)> {
+    let key = Arc::new(import_into_software_ksp(pkcs8)?);
+    Ok((
+        CngRecipientKey {
+            certificate: certificate.clone(),
+            key: key.clone(),
+        },
+        CngSigningKey { certificate, key },
+    ))
+}
+
+/// Imports the PKCS #8 (RFC 5958) private key `pkcs8`, RSA or EC on P-256, P-384 or P-521, into
+/// the Microsoft Software Key Storage Provider, as a key with no certificate, e.g. to sign its own
+/// certificate request. The key is not persisted. CNG derives the public key from the private one,
+/// so an EC key need not carry its public key. A key of another type, e.g. ML-DSA, is declined.
+pub fn import_pkcs8_key(pkcs8: &[u8]) -> Result<CngKey> {
+    CngKey::new(import_into_software_ksp(pkcs8)?)
+}
+
+/// Imports `pkcs8` into the Microsoft Software Key Storage Provider, as an unnamed key that is not
+/// persisted.
+fn import_into_software_ksp(pkcs8: &[u8]) -> Result<NcryptKey> {
     use windows_sys::Win32::Security::Cryptography::{
         NCryptFinalizeKey, NCryptOpenStorageProvider, MS_KEY_STORAGE_PROVIDER,
         NCRYPT_DO_NOT_FINALIZE_FLAG, NCRYPT_PKCS8_PRIVATE_KEY_BLOB,
     };
     let mut provider: NCRYPT_PROV_HANDLE = 0;
     let mut key: NCRYPT_KEY_HANDLE = 0;
-    // SAFETY: the provider is freed below; the key is owned by the returned credentials.
+    // SAFETY: the provider is freed below; the key is owned by the returned NcryptKey.
     let status = unsafe {
         let status = NCryptOpenStorageProvider(&mut provider, MS_KEY_STORAGE_PROVIDER, 0);
         if !succeeded(status) {
@@ -1007,12 +1127,5 @@ pub fn import_pkcs8(
             "NCrypt could not import a key: {status:#010x}"
         )));
     }
-    let key = Arc::new(NcryptKey(key));
-    Ok((
-        CngRecipientKey {
-            certificate: certificate.clone(),
-            key: key.clone(),
-        },
-        CngSigningKey { certificate, key },
-    ))
+    Ok(NcryptKey(key))
 }
