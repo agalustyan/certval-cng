@@ -15,6 +15,13 @@ Signing keys without a certificate (certval-cms's `SigningKey`), e.g. to sign a 
 `CngKey`, which `import_pkcs8_key` makes from a PKCS #8 RSA or EC key, its public key exported by
 CNG.
 
+ML-DSA-44, -65 and -87, pure with an empty context string, where this Windows' CNG has ML-DSA
+(recent Windows 11 builds), which `CngCrypto::ml_dsa_available()` reports:
+certificate and message signature verification through the message interface, and with `cms`,
+signing by `CngSigningKey` and `CngKey`, an ML-DSA PKCS #8 key importing into CNG as other keys
+do. Without CNG's ML-DSA the provider declines it, as before. The `pqc` feature now also enables
+certval-cms's software ML-DSA signing, for the tests.
+
 ## [0.1.0-rc.1] - 2026-10-31
 
 Initial release. Calculates SHA-1/256/384/512 digests and verifies RSA PKCS #1 v1.5, RSASSA-PSS and

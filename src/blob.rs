@@ -15,7 +15,7 @@
 //! The headers are written field by field rather than by casting the `windows-sys` structs, which
 //! keeps this module free of `unsafe` and buildable, and testable, on any platform.
 
-use crate::algorithm::Padding;
+use crate::algorithm::{MlDsa, Padding};
 use certval::{
     PKIXALG_EC_PUBLIC_KEY, PKIXALG_RSASSA_PSS, PKIXALG_RSA_ENCRYPTION, PKIXALG_SECP256R1,
     PKIXALG_SECP384R1, PKIXALG_SECP521R1,
@@ -42,6 +42,8 @@ pub(crate) const ECDH_PUBLIC_P384_MAGIC: u32 = 0x334B_4345;
 /// `BCRYPT_ECDH_PUBLIC_P521_MAGIC`, "ECK5".
 #[cfg_attr(not(feature = "cms"), allow(dead_code))]
 pub(crate) const ECDH_PUBLIC_P521_MAGIC: u32 = 0x354B_4345;
+/// `BCRYPT_MLDSA_PUBLIC_MAGIC`, "DSPK".
+pub(crate) const MLDSA_PUBLIC_MAGIC: u32 = 0x4B50_5344;
 /// `BCRYPT_ECDSA_PUBLIC_GENERIC_MAGIC`, "ECDP": a key of the generic ECDSA algorithm, whose blob
 /// does not name its curve.
 #[cfg_attr(not(feature = "cms"), allow(dead_code))]
@@ -256,6 +258,66 @@ pub(crate) fn ecc_spki_from_blob(blob: &[u8]) -> Option<SubjectPublicKeyInfoOwne
     })
 }
 
+/// An ML-DSA parameter set's name as a `BCRYPT_PQDSA_KEY_BLOB` carries it: UTF-16LE, ending in a
+/// null.
+fn parameter_set_utf16(set: MlDsa) -> Vec<u8> {
+    set.parameter_set()
+        .encode_utf16()
+        .chain([0])
+        .flat_map(u16::to_le_bytes)
+        .collect()
+}
+
+/// Builds a `BCRYPT_PQDSA_PUBLIC_BLOB` for an ML-DSA `spki`, together with its parameter set: a
+/// `BCRYPT_PQDSA_KEY_BLOB` header, the parameter set's name, then the public key, which the
+/// `SubjectPublicKeyInfo` carries as it is (RFC 9881). The key's parameters must be absent and its
+/// length the parameter set's.
+pub(crate) fn ml_dsa_public_blob(spki: &SubjectPublicKeyInfoOwned) -> Option<(MlDsa, Vec<u8>)> {
+    let set = MlDsa::from_algorithm(&spki.algorithm)?;
+    let key = spki.subject_public_key.as_bytes()?;
+    if key.len() != set.public_key_len() {
+        return None;
+    }
+    let name = parameter_set_utf16(set);
+    let mut blob = Vec::with_capacity(12 + name.len() + key.len());
+    for field in [
+        MLDSA_PUBLIC_MAGIC,
+        u32::try_from(name.len()).ok()?,
+        u32::try_from(key.len()).ok()?,
+    ] {
+        blob.extend_from_slice(&field.to_le_bytes());
+    }
+    blob.extend_from_slice(&name);
+    blob.extend_from_slice(key);
+    Some((set, blob))
+}
+
+/// The `SubjectPublicKeyInfo` for a `BCRYPT_PQDSA_PUBLIC_BLOB` of an ML-DSA key, as
+/// `NCryptExportKey` gives one: the reverse of [`ml_dsa_public_blob`].
+#[cfg_attr(not(feature = "cms"), allow(dead_code))]
+pub(crate) fn ml_dsa_spki_from_blob(blob: &[u8]) -> Option<SubjectPublicKeyInfoOwned> {
+    if header_field(blob, 0)? != MLDSA_PUBLIC_MAGIC {
+        return None;
+    }
+    let name_len = usize::try_from(header_field(blob, 1)?).ok()?;
+    let key_len = usize::try_from(header_field(blob, 2)?).ok()?;
+    let name = blob.get(12..12 + name_len)?;
+    let key = blob.get(12 + name_len..12 + name_len + key_len)?;
+    let set = MlDsa::ALL
+        .into_iter()
+        .find(|set| parameter_set_utf16(*set) == name)?;
+    if key.len() != set.public_key_len() {
+        return None;
+    }
+    Some(SubjectPublicKeyInfoOwned {
+        algorithm: AlgorithmIdentifierOwned {
+            oid: set.oid(),
+            parameters: None,
+        },
+        subject_public_key: BitString::from_bytes(key).ok()?,
+    })
+}
+
 /// Reshapes a DER ECDSA signature into fixed-width `r‖s`.
 ///
 /// `field_len` comes from the curve rather than from the signature, since either integer can be
@@ -450,6 +512,58 @@ mod tests {
         let (_, blob) = ecc_public_blob(&ec_spki(PKIXALG_SECP256R1, &point)).unwrap();
         assert!(ecc_spki_from_blob(&blob[..blob.len() - 1]).is_none());
         assert!(ecc_spki_from_blob(&RSAPUBLIC_MAGIC.to_le_bytes()).is_none());
+    }
+
+    fn ml_dsa_spki(set: MlDsa, key: &[u8]) -> SubjectPublicKeyInfoOwned {
+        SubjectPublicKeyInfoOwned {
+            algorithm: AlgorithmIdentifierOwned {
+                oid: set.oid(),
+                parameters: None,
+            },
+            subject_public_key: BitString::from_bytes(key).unwrap(),
+        }
+    }
+
+    #[test]
+    fn ml_dsa_blob_layout() {
+        for set in MlDsa::ALL {
+            let key: Vec<u8> = (0..set.public_key_len()).map(|i| i as u8).collect();
+            let (found, blob) = ml_dsa_public_blob(&ml_dsa_spki(set, &key)).unwrap();
+            assert_eq!(found, set);
+            assert_eq!(le(&blob, 0), MLDSA_PUBLIC_MAGIC);
+            // Two digits and a null, each a UTF-16 code unit.
+            assert_eq!(le(&blob, 1), 6);
+            assert_eq!(le(&blob, 2) as usize, key.len());
+            let name: Vec<u8> = set
+                .parameter_set()
+                .bytes()
+                .flat_map(|b| [b, 0])
+                .chain([0, 0])
+                .collect();
+            assert_eq!(&blob[12..18], name.as_slice());
+            assert_eq!(&blob[18..], key.as_slice());
+        }
+    }
+
+    #[test]
+    fn ml_dsa_spki_round_trips_through_the_blob() {
+        for set in MlDsa::ALL {
+            let spki = ml_dsa_spki(set, &vec![0x5a; set.public_key_len()]);
+            let (_, blob) = ml_dsa_public_blob(&spki).unwrap();
+            assert_eq!(ml_dsa_spki_from_blob(&blob).unwrap(), spki);
+        }
+    }
+
+    #[test]
+    fn ml_dsa_key_must_fit_its_parameter_set() {
+        // ML-DSA-65's length under ML-DSA-44's OID.
+        let spki = ml_dsa_spki(MlDsa::MlDsa44, &[0; 1952]);
+        assert!(ml_dsa_public_blob(&spki).is_none());
+        let mut with_parameters = ml_dsa_spki(MlDsa::MlDsa44, &[0; 1312]);
+        with_parameters.algorithm.parameters = Some(Any::null());
+        assert!(ml_dsa_public_blob(&with_parameters).is_none());
+        let (_, blob) = ml_dsa_public_blob(&ml_dsa_spki(MlDsa::MlDsa44, &[0; 1312])).unwrap();
+        assert!(ml_dsa_spki_from_blob(&blob[..blob.len() - 1]).is_none());
     }
 
     #[test]

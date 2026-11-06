@@ -60,14 +60,18 @@ this crate.
 | RSA PKCS #1 v1.5, SHA-256/384/512 | `BCRYPT_PAD_PKCS1` | |
 | RSASSA-PSS, SHA-256/384/512 | `BCRYPT_PAD_PSS` | salt length taken from the parameters |
 | ECDSA on P-256/384/521, SHA-256/384/512 | none | signature reshaped to fixed-width `r‖s` |
+| ML-DSA-44/65/87, pure, empty context | `BCRYPT_PAD_PQDSA` | message interface only; where this Windows' CNG has ML-DSA |
 
 | Hash | |
 |---|---|
 | SHA-1, SHA-256, SHA-384, SHA-512 | `BCryptHash` |
 
-CNG verifies digests only, so the message interface hashes with `BCryptHash` and then verifies as the
-digest interface does; both the hash and the verification happen inside CNG. Anything else is
-declined, and software answers it. The deliberate declines:
+CNG verifies RSA and ECDSA over digests only, so the message interface hashes with `BCryptHash` and
+then verifies as the digest interface does; both the hash and the verification happen inside CNG.
+ML-DSA signs the message itself (RFC 9881), which CNG takes as it is, so it has the message
+interface only. Recent Windows 11 builds have ML-DSA in CNG; `CngCrypto::ml_dsa_available()`
+reports whether this Windows does, and without it ML-DSA is declined. The SDK's ML-DSA definitions, which windows-sys does not yet bind, are restated in the
+crate. Anything else is declined, and software answers it. The deliberate declines:
 
 - **SHA-224 throughout.** CNG has no SHA-224 provider.
 - **RSASSA-PSS with a mask other than MGF1 over the message hash**, or relying on RFC 4055's SHA-1
@@ -76,15 +80,19 @@ declined, and software answers it. The deliberate declines:
 - **An elliptic curve key on any curve but P-256, P-384 or P-521.**
 - **A PKCS #1 v1.5 signature under a key identified as `id-RSASSA-PSS`.** RFC 4055 restricts such a
   key to PSS, and certval's software verifier rejects the combination, so it gives that verdict.
-- **ML-DSA.**
+- **ML-DSA with parameters in its algorithm identifier**, which RFC 9881 requires to be absent, or
+  under a key of another parameter set.
 
-Three encoding differences between X.509 and CNG are bridged internally:
+Four encoding differences between X.509 and CNG are bridged internally:
 
 - an RSA key travels as a DER `RSAPublicKey`, while `BCRYPT_RSAPUBLIC_BLOB` is a header followed by
   the big-endian exponent and modulus, without DER's leading sign byte;
 - an elliptic curve key travels as an uncompressed point with the curve named separately, while
   `BCRYPT_ECCPUBLIC_BLOB` names the curve in its header's magic number;
-- an ECDSA signature travels as `SEQUENCE { r, s }`, while CNG uses fixed-width `r‖s`.
+- an ECDSA signature travels as `SEQUENCE { r, s }`, while CNG uses fixed-width `r‖s`;
+- an ML-DSA key travels as the bare public key with the parameter set named by its OID, while
+  `BCRYPT_PQDSA_PUBLIC_BLOB` is a `BCRYPT_PQDSA_KEY_BLOB` header, the parameter set's name in
+  UTF-16, then the key.
 
 ## CMS
 
@@ -98,16 +106,15 @@ lists them. `import_pkcs8` makes both for a key imported into the Microsoft Soft
 
 A key with no certificate yet, e.g. one signing its own certificate request or a self-signed
 certificate, is certval-cms's `SigningKey`: `CngKey`, which `import_pkcs8_key` makes from a PKCS #8
-RSA or EC key imported into the same provider. It signs as `CngSigningKey` does, and its public key
-is the one CNG exports for it, so an EC key need not carry its public key. An ML-DSA key is
-declined.
+RSA, EC or ML-DSA key imported into the same provider. It signs as `CngSigningKey` does, and its
+public key is the one CNG exports for it, so an EC key need not carry its public key.
 
 | Operation | Coverage |
 |---|---|
 | Content encryption and decryption | AES-128/192/256 in CBC and GCM, by BCrypt |
 | Key transport | RSAES-PKCS1-v1_5, RSAES-OAEP with SHA-1/256/384/512, by `BCryptEncrypt` and `NCryptDecrypt` |
 | Key agreement | ECDH on P-256, P-384 and P-521, by `BCryptSecretAgreement` to encrypt and `NCryptSecretAgreement` to decrypt; the X9.63 KDF and AES key wrap by certval-cms |
-| Signing | RSA PKCS #1 v1.5 and RSASSA-PSS, and ECDSA, by `NCryptSignHash`, over a digest the environment computes |
+| Signing | RSA PKCS #1 v1.5 and RSASSA-PSS, and ECDSA, by `NCryptSignHash`, over a digest the environment computes; pure ML-DSA-44/65/87 with an empty context, by `NCryptSignHash` over the message, where this Windows' CNG has ML-DSA |
 | KEM | declined |
 
 CNG has no X9.63 KDF, so for key agreement CNG returns the shared secret (`BCRYPT_KDF_RAW_SECRET`),
@@ -120,7 +127,10 @@ recovers it; the private key stays in its store.
 table and the key blob encoding). On Windows it adds the signature tests: ECDSA signatures made by
 RustCrypto with fixed keys, and RSA and RSASSA-PSS signatures from keys CNG generates in memory,
 each checked against certval's software verifier, and each also checked with a changed message and a
-changed signature, which must be **rejections**, not refusals.
+changed signature, which must be **rejections**, not refusals. With `cms` and `pqc`, and where this
+Windows' CNG has ML-DSA, ML-DSA-44, -65 and -87 keys made in software are imported into CNG, sign
+SignedData and their own certificate requests, which software verifies, and CNG alone verifies
+SignedData software signs.
 
 The collection tests verify certificates through the provider and compare against software. No
 certificates are carried in this repository; the collections are named by environment variables, and
@@ -131,7 +141,7 @@ a test whose collection is not set reports that and passes.
 | `CERTVAL_CNG_RSA_CERTS` | directory of RSA-signed certificates |
 | `CERTVAL_CNG_ECDSA_CERTS` | directory of ECDSA-signed certificates |
 | `CERTVAL_CNG_PSS_CERTS` | directory of RSASSA-PSS-signed certificates |
-| `CERTVAL_CNG_MLDSA_CERTS` | directory of ML-DSA-signed certificates, which the provider must decline |
+| `CERTVAL_CNG_MLDSA_CERTS` | directory of ML-DSA-signed certificates, which the provider must answer where this Windows' CNG has ML-DSA, and decline where it does not |
 
 ```powershell
 $EX = "..\rust-pki\certval\tests\examples"
@@ -140,7 +150,7 @@ $env:CERTVAL_CNG_ECDSA_CERTS = "$EX\PKITS_data_p256\certs"
 $env:CERTVAL_CNG_PSS_CERTS = "$EX\rsapss"
 $env:CERTVAL_CNG_MLDSA_CERTS = "$EX\pkits_ml_dsa_44\certs"
 
-cargo test --features pqc -- --nocapture
+cargo test --features pqc,cms -- --nocapture
 ```
 
 The assertion in each case is **agreement**, not success, and `--nocapture` prints how many
@@ -152,6 +162,11 @@ Run in CI on GitHub's hosted Windows runner against rust-pki's PKITS collections
 389 RSA and 388 ECDSA verifications that software accepted, and both RSASSA-PSS ones, with no
 disagreements in either interface, and declined every ML-DSA one. Changed messages and changed
 signatures were rejections, not refusals. The runner was not in FIPS-approved mode.
+
+ML-DSA has been run on Windows 11 build 26300, whose CNG has it, against rust-pki's ML-DSA-44, -65
+and -87 PKITS collections: CNG answered all 390 verifications software accepted in each, with no
+disagreements. Whether GitHub's hosted runner has ML-DSA in CNG decides whether CI exercises it or
+the fall-through to software.
 
 The `cms` feature has been type-checked for Windows but not yet run; its tests run first in Windows
 CI.

@@ -37,19 +37,20 @@ use windows_sys::Win32::Security::Cryptography::{
     BCRYPT_BLOCK_PADDING, BCRYPT_ECCPUBLIC_BLOB, BCRYPT_ECDH_PUBLIC_P256_MAGIC,
     BCRYPT_ECDH_PUBLIC_P384_MAGIC, BCRYPT_ECDH_PUBLIC_P521_MAGIC, BCRYPT_KDF_RAW_SECRET,
     BCRYPT_KEY_HANDLE, BCRYPT_OAEP_PADDING_INFO, BCRYPT_PAD_OAEP, BCRYPT_PAD_PKCS1, BCRYPT_PAD_PSS,
-    BCRYPT_PKCS1_PADDING_INFO, BCRYPT_PSS_PADDING_INFO, BCRYPT_RSAPUBLIC_BLOB,
-    BCRYPT_USE_SYSTEM_PREFERRED_RNG, CERT_CONTEXT, CERT_NCRYPT_KEY_SPEC,
+    BCRYPT_PKCS1_PADDING_INFO, BCRYPT_PSS_PADDING_INFO, BCRYPT_PUBLIC_KEY_BLOB,
+    BCRYPT_RSAPUBLIC_BLOB, BCRYPT_USE_SYSTEM_PREFERRED_RNG, CERT_CONTEXT, CERT_NCRYPT_KEY_SPEC,
     CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG, NCRYPT_KEY_HANDLE, NCRYPT_PROVIDER_HANDLE_PROPERTY,
     NCRYPT_PROV_HANDLE, NCRYPT_SECRET_HANDLE,
 };
 use x509_cert::Certificate;
 use zeroize::Zeroizing;
 
-use crate::algorithm::{signature_scheme, Hash, Padding};
+use crate::algorithm::{signature_scheme, Hash, MlDsa, Padding};
 use crate::blob::{
-    ecc_public_blob, ecc_spki_from_blob, rsa_public_blob, rsa_spki_from_blob, Curve,
+    ecc_public_blob, ecc_spki_from_blob, ml_dsa_spki_from_blob, rsa_public_blob,
+    rsa_spki_from_blob, Curve,
 };
-use crate::cng::{hash_name, import_rsa};
+use crate::cng::{hash_name, import_rsa, PqdsaPaddingInfo, PAD_PQDSA, PQDSA_PUBLIC_BLOB};
 use crate::CngCrypto;
 
 /// Length in octets of an AES-CBC IV.
@@ -754,17 +755,36 @@ struct EcdsaSignature {
     s: Uint,
 }
 
-/// A [`SigningCredential`] whose private key is an NCrypt key: RSA PKCS #1 v1.5 or RSASSA-PSS, or
-/// ECDSA, by `NCryptSignHash`. NCrypt signs digests, so the message is hashed first, by the
-/// environment's `PkiEnvironment`.
+/// A [`SigningCredential`] whose private key is an NCrypt key, by `NCryptSignHash`: RSA PKCS #1
+/// v1.5 or RSASSA-PSS, or ECDSA, over a digest the environment's `PkiEnvironment` computes, and
+/// pure ML-DSA, where this Windows' CNG offers it, over the message.
 pub struct CngSigningKey {
     certificate: Certificate,
     key: Arc<NcryptKey>,
 }
 
+impl CngSigningKey {
+    fn key_algorithm(&self) -> const_oid::ObjectIdentifier {
+        self.certificate
+            .tbs_certificate()
+            .subject_public_key_info()
+            .algorithm
+            .oid
+    }
+}
+
 impl SigningCredential for CngSigningKey {
     fn certificate(&self) -> &Certificate {
         &self.certificate
+    }
+
+    fn sign_message(
+        &self,
+        _env: &CmsEnvironment,
+        alg: &AlgorithmIdentifierOwned,
+        message: &[u8],
+    ) -> Result<Vec<u8>> {
+        ncrypt_sign_message(&self.key, self.key_algorithm(), alg, message)
     }
 
     fn sign_digest(
@@ -773,13 +793,7 @@ impl SigningCredential for CngSigningKey {
         alg: &AlgorithmIdentifierOwned,
         digest: &[u8],
     ) -> Result<Vec<u8>> {
-        let key_alg = self
-            .certificate
-            .tbs_certificate()
-            .subject_public_key_info()
-            .algorithm
-            .oid;
-        ncrypt_sign_digest(&self.key, key_alg, alg, digest)
+        ncrypt_sign_digest(&self.key, self.key_algorithm(), alg, digest)
     }
 }
 
@@ -792,14 +806,20 @@ pub struct CngKey {
 }
 
 impl CngKey {
-    /// A key for `key`, its public key read back from CNG: RSA, or EC on P-256, P-384 or P-521.
-    /// Any other key, e.g. ML-DSA, is declined.
+    /// A key for `key`, its public key read back from CNG: RSA, EC on P-256, P-384 or P-521, or
+    /// ML-DSA. Any other key is declined.
     fn new(key: NcryptKey) -> Result<Self> {
         let public_key = export_public(&key, BCRYPT_RSAPUBLIC_BLOB)
             .and_then(|blob| rsa_spki_from_blob(&blob))
             .or_else(|| {
                 export_public(&key, BCRYPT_ECCPUBLIC_BLOB)
                     .and_then(|blob| ecc_spki_from_blob(&blob))
+            })
+            .or_else(|| {
+                // NCrypt's generic public key blob for a post-quantum key is the BCrypt one.
+                export_public(&key, PQDSA_PUBLIC_BLOB)
+                    .or_else(|| export_public(&key, BCRYPT_PUBLIC_KEY_BLOB))
+                    .and_then(|blob| ml_dsa_spki_from_blob(&blob))
             })
             .ok_or(Error::Unrecognized)?;
         Ok(Self {
@@ -822,6 +842,57 @@ impl SigningKey for CngKey {
     ) -> Result<Vec<u8>> {
         ncrypt_sign_digest(&self.key, self.public_key.algorithm.oid, alg, digest)
     }
+
+    fn sign_message(
+        &self,
+        _env: &CmsEnvironment,
+        alg: &AlgorithmIdentifierOwned,
+        message: &[u8],
+    ) -> Result<Vec<u8>> {
+        ncrypt_sign_message(&self.key, self.public_key.algorithm.oid, alg, message)
+    }
+}
+
+/// Signs `message` with the NCrypt `key`, whose public key is identified as `key_alg`: pure
+/// ML-DSA with an empty context string, by `NCryptSignHash`, which takes the message itself.
+/// `alg` must name the key's parameter set. Anything else is declined, for RSA and ECDSA sign
+/// a digest.
+fn ncrypt_sign_message(
+    key: &NcryptKey,
+    key_alg: const_oid::ObjectIdentifier,
+    alg: &AlgorithmIdentifierOwned,
+    message: &[u8],
+) -> Result<Vec<u8>> {
+    let Some(set) = MlDsa::from_algorithm(alg) else {
+        return Err(Error::Unrecognized);
+    };
+    if set.oid() != key_alg {
+        return Err(Error::Unrecognized);
+    }
+    let padding = PqdsaPaddingInfo::pure();
+    let mut signature = vec![0u8; set.signature_len()];
+    let mut written = 0u32;
+    // SAFETY: the key is live, the padding info outlives the call, and NCrypt writes at most the
+    // signature buffer's length, reporting how many octets.
+    let status = unsafe {
+        NCryptSignHash(
+            key.0,
+            (&padding as *const PqdsaPaddingInfo).cast(),
+            message.as_ptr(),
+            len32(message)?,
+            signature.as_mut_ptr(),
+            len32(&signature)?,
+            &mut written,
+            PAD_PQDSA,
+        )
+    };
+    if !succeeded(status) {
+        debug!("NCrypt could not sign with ML-DSA: {status:#010x}");
+        return Err(Error::Crypto(String::from("signing failed")));
+    }
+    signature.truncate(written as usize);
+    trace!("CNG signed with {}", alg.oid);
+    Ok(signature)
 }
 
 /// The public half of `key` as a `blob_type` blob, or `None` when NCrypt does not export it as
@@ -1078,10 +1149,11 @@ pub fn import_pkcs8(
     ))
 }
 
-/// Imports the PKCS #8 (RFC 5958) private key `pkcs8`, RSA or EC on P-256, P-384 or P-521, into
-/// the Microsoft Software Key Storage Provider, as a key with no certificate, e.g. to sign its own
-/// certificate request. The key is not persisted. CNG derives the public key from the private one,
-/// so an EC key need not carry its public key. A key of another type, e.g. ML-DSA, is declined.
+/// Imports the PKCS #8 (RFC 5958) private key `pkcs8`, RSA, EC on P-256, P-384 or P-521, or ML-DSA
+/// where this Windows' CNG offers it, into the Microsoft Software Key Storage Provider, as a key
+/// with no certificate, e.g. to sign its own certificate request. The key is not persisted. CNG
+/// derives the public key from the private one, so an EC key need not carry its public key. A key
+/// of another type is declined.
 pub fn import_pkcs8_key(pkcs8: &[u8]) -> Result<CngKey> {
     CngKey::new(import_into_software_ksp(pkcs8)?)
 }

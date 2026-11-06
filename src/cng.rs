@@ -4,10 +4,10 @@
 //! available from Windows 10. A pseudo-handle needs no `BCryptOpenAlgorithmProvider` and no
 //! closing, and is usable from any thread, so the provider holds no handles of its own.
 
-use crate::algorithm::{Hash, Padding};
-use crate::blob::Curve;
+use crate::algorithm::{Hash, MlDsa, Padding};
+use crate::blob::{ml_dsa_public_blob, Curve};
 use log::debug;
-use windows_sys::core::PCWSTR;
+use windows_sys::core::{w, PCWSTR};
 use windows_sys::Win32::Foundation::{NTSTATUS, STATUS_INVALID_SIGNATURE};
 use windows_sys::Win32::Security::Cryptography::{
     BCryptDestroyKey, BCryptGetFipsAlgorithmMode, BCryptHash, BCryptImportKeyPair,
@@ -21,6 +21,36 @@ use windows_sys::Win32::Security::Cryptography::{
 
 fn succeeded(status: NTSTATUS) -> bool {
     status >= 0
+}
+
+// ML-DSA, from the Windows 11 SDK's bcrypt.h (10.0.26100), which windows-sys 0.61 does not bind.
+
+/// `BCRYPT_MLDSA_ALG_HANDLE`, the ML-DSA pseudo-handle.
+const MLDSA_ALG_HANDLE: BCRYPT_ALG_HANDLE = 0x0000_0471 as BCRYPT_ALG_HANDLE;
+/// `BCRYPT_PQDSA_PUBLIC_BLOB`.
+pub(crate) const PQDSA_PUBLIC_BLOB: PCWSTR = w!("PQDSAPUBLICBLOB");
+/// `BCRYPT_PAD_PQDSA` (and `NCRYPT_PAD_PQDSA_FLAG`): the padding information is a
+/// [`PqdsaPaddingInfo`].
+pub(crate) const PAD_PQDSA: u32 = 0x0000_0020;
+
+/// `BCRYPT_PQDSA_PADDING_INFO`: the context string, and the hash of a pre-hashed (HashML-DSA)
+/// signature, null for pure ML-DSA.
+#[repr(C)]
+pub(crate) struct PqdsaPaddingInfo {
+    pb_ctx: *mut u8,
+    cb_ctx: u32,
+    psz_prehash_alg_id: PCWSTR,
+}
+
+impl PqdsaPaddingInfo {
+    /// Pure ML-DSA with an empty context string, as RFC 9881 and RFC 9882 require.
+    pub(crate) fn pure() -> Self {
+        Self {
+            pb_ctx: std::ptr::null_mut(),
+            cb_ctx: 0,
+            psz_prehash_alg_id: std::ptr::null(),
+        }
+    }
 }
 
 fn hash_handle(hash: Hash) -> BCRYPT_ALG_HANDLE {
@@ -126,6 +156,63 @@ pub(crate) fn import_ecdsa(curve: Curve, blob: &[u8]) -> Option<Key> {
     import(algorithm, BCRYPT_ECCPUBLIC_BLOB, blob)
 }
 
+/// Imports a `BCRYPT_PQDSA_PUBLIC_BLOB` of an ML-DSA key.
+pub(crate) fn import_ml_dsa(blob: &[u8]) -> Option<Key> {
+    import(MLDSA_ALG_HANDLE, PQDSA_PUBLIC_BLOB, blob)
+}
+
+/// Whether CNG offers ML-DSA, as recent Windows 11 builds do: whether it imports a public key of
+/// each parameter set. A public key is any string of bytes of the right
+/// length, so one of zeros serves.
+pub(crate) fn ml_dsa_available() -> bool {
+    MlDsa::ALL.into_iter().all(|set| {
+        let spki = spki::SubjectPublicKeyInfoOwned {
+            algorithm: spki::AlgorithmIdentifierOwned {
+                oid: set.oid(),
+                parameters: None,
+            },
+            subject_public_key: der::asn1::BitString::from_bytes(&vec![0; set.public_key_len()])
+                .expect("a bit string of whole octets"),
+        };
+        ml_dsa_public_blob(&spki).is_some_and(|(_, blob)| import_ml_dsa(&blob).is_some())
+    })
+}
+
+/// Verifies a pure ML-DSA `signature` over `message` with `key`.
+pub(crate) fn verify_ml_dsa(key: &Key, message: &[u8], signature: &[u8]) -> Verdict {
+    let (Ok(message_len), Ok(signature_len)) =
+        (u32::try_from(message.len()), u32::try_from(signature.len()))
+    else {
+        return Verdict::Declined(0);
+    };
+    let padding = PqdsaPaddingInfo::pure();
+    // SAFETY: the key handle is live for the borrow, the padding structure outlives the call, and
+    // both buffers are live with the lengths passed. For pure ML-DSA, CNG takes the message where
+    // it otherwise takes a hash.
+    let status = unsafe {
+        BCryptVerifySignature(
+            key.0,
+            (&padding as *const PqdsaPaddingInfo).cast(),
+            message.as_ptr(),
+            message_len,
+            signature.as_ptr(),
+            signature_len,
+            PAD_PQDSA,
+        )
+    };
+    verdict(status)
+}
+
+fn verdict(status: NTSTATUS) -> Verdict {
+    if succeeded(status) {
+        Verdict::Valid
+    } else if status == STATUS_INVALID_SIGNATURE {
+        Verdict::Invalid
+    } else {
+        Verdict::Declined(status)
+    }
+}
+
 /// What `BCryptVerifySignature` made of a signature.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Verdict {
@@ -189,14 +276,7 @@ pub(crate) fn verify(
             flags,
         )
     };
-
-    if succeeded(status) {
-        Verdict::Valid
-    } else if status == STATUS_INVALID_SIGNATURE {
-        Verdict::Invalid
-    } else {
-        Verdict::Declined(status)
-    }
+    verdict(status)
 }
 
 /// Reports whether CNG is in FIPS-approved mode, or `None` when the query fails.

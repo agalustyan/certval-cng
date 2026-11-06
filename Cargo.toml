@@ -18,10 +18,10 @@ include = ["src/**/*.rs", "README.md", "CHANGELOG.md", "LICENSE-APACHE", "LICENS
 
 [features]
 default = []
-# Enables certval's software ML-DSA implementation. The provider needs nothing from it, since it
-# declines ML-DSA, but without it the ML-DSA collection test has no software verdict to compare
-# against and every pair is "no opinion".
-pqc = ["certval/pqc"]
+# Enables certval's software ML-DSA verification, and with `cms`, certval-cms's software ML-DSA
+# signing. The provider needs neither, since its ML-DSA is CNG's, but without them the ML-DSA tests
+# have no software to compare against.
+pqc = ["certval/pqc", "certval-cms?/pqc"]
 # Implements certval-cms's content encryption and decryption and key transport by BCrypt, and
 # recipient and signing credentials over NCrypt keys, including those in the certificate store.
 cms = ["dep:certval-cms", "dep:cms", "dep:x509-cert", "dep:zeroize"]
@@ -61,6 +61,8 @@ rsa = { version = "=0.10.0-rc.21", features = ["encoding"] }
 elliptic-curve = { version = "0.14.3", features = ["arithmetic"] }
 getrandom = { version = "0.4.1", features = ["sys_rng"] }
 rand_core = "0.10.1"
+# The ML-DSA cms tests, under `pqc`: keys generated in software, as PKCS #8 for CNG to import.
+ml-dsa = { version = "0.1.1", features = ["pkcs8"] }
 
 [package.metadata.docs.rs]
 # The provider exists only on Windows.

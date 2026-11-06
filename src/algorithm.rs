@@ -1,8 +1,9 @@
 //! Translation from the algorithm identifiers certval presents to the hash and padding CNG needs.
 //!
-//! CNG verifies signatures over digests only (`BCryptVerifySignature` takes a hash), so the
-//! message interface hashes with `BCryptHash` first and then verifies exactly as the digest
-//! interface does. Both interfaces therefore share one table.
+//! CNG verifies RSA and ECDSA signatures over digests only (`BCryptVerifySignature` takes a hash),
+//! so the message interface hashes with `BCryptHash` first and then verifies exactly as the digest
+//! interface does. Both interfaces therefore share one table. ML-DSA is pure, signing the message
+//! itself, so it has a table of its own and only the message interface.
 
 use certval::{
     PKIXALG_ECDSA_WITH_SHA256, PKIXALG_ECDSA_WITH_SHA384, PKIXALG_ECDSA_WITH_SHA512, PKIXALG_MGF1,
@@ -10,9 +11,77 @@ use certval::{
     PKIXALG_SHA384, PKIXALG_SHA384_WITH_RSA_ENCRYPTION, PKIXALG_SHA512,
     PKIXALG_SHA512_WITH_RSA_ENCRYPTION,
 };
+use const_oid::db::fips204::{ID_ML_DSA_44, ID_ML_DSA_65, ID_ML_DSA_87};
 use const_oid::ObjectIdentifier;
 use der::{Decode, Encode};
 use spki::AlgorithmIdentifierOwned;
+
+/// An ML-DSA parameter set (FIPS 204), signing purely: over the message, with an empty context
+/// string, as RFC 9881 has certificates and CRLs and RFC 9882 has CMS.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum MlDsa {
+    MlDsa44,
+    MlDsa65,
+    MlDsa87,
+}
+
+impl MlDsa {
+    /// The parameter set an ML-DSA OID names, for a key or a signature algorithm.
+    pub(crate) fn from_oid(oid: &ObjectIdentifier) -> Option<Self> {
+        match *oid {
+            ID_ML_DSA_44 => Some(MlDsa::MlDsa44),
+            ID_ML_DSA_65 => Some(MlDsa::MlDsa65),
+            ID_ML_DSA_87 => Some(MlDsa::MlDsa87),
+            _ => None,
+        }
+    }
+
+    /// The parameter set of an ML-DSA signature algorithm identifier, whose parameters RFC 9881
+    /// requires to be absent. An identifier with parameters is declined, and software judges it.
+    pub(crate) fn from_algorithm(alg: &AlgorithmIdentifierOwned) -> Option<Self> {
+        if alg.parameters.is_some() {
+            return None;
+        }
+        Self::from_oid(&alg.oid)
+    }
+
+    pub(crate) fn oid(self) -> ObjectIdentifier {
+        match self {
+            MlDsa::MlDsa44 => ID_ML_DSA_44,
+            MlDsa::MlDsa65 => ID_ML_DSA_65,
+            MlDsa::MlDsa87 => ID_ML_DSA_87,
+        }
+    }
+
+    /// The name CNG gives the parameter set (`BCRYPT_MLDSA_PARAMETER_SET_*`).
+    pub(crate) fn parameter_set(self) -> &'static str {
+        match self {
+            MlDsa::MlDsa44 => "44",
+            MlDsa::MlDsa65 => "65",
+            MlDsa::MlDsa87 => "87",
+        }
+    }
+
+    /// The size in octets of a public key (FIPS 204, table 2).
+    pub(crate) fn public_key_len(self) -> usize {
+        match self {
+            MlDsa::MlDsa44 => 1312,
+            MlDsa::MlDsa65 => 1952,
+            MlDsa::MlDsa87 => 2592,
+        }
+    }
+
+    /// The size in octets of a signature (FIPS 204, table 2).
+    pub(crate) fn signature_len(self) -> usize {
+        match self {
+            MlDsa::MlDsa44 => 2420,
+            MlDsa::MlDsa65 => 3309,
+            MlDsa::MlDsa87 => 4627,
+        }
+    }
+
+    pub(crate) const ALL: [MlDsa; 3] = [MlDsa::MlDsa44, MlDsa::MlDsa65, MlDsa::MlDsa87];
+}
 
 /// A hash CNG provides. SHA-224 is absent because CNG has no SHA-224 provider, so SHA-224
 /// signatures and digests are left to software.
@@ -197,9 +266,31 @@ mod tests {
     }
 
     #[test]
-    fn unknown_algorithm_is_declined() {
-        let ml_dsa_44 = const_oid::db::fips204::ID_ML_DSA_44;
-        assert!(signature_scheme(&plain(ml_dsa_44)).is_none());
+    fn ml_dsa_is_not_a_digest_scheme() {
+        // ML-DSA signs the message, so it has no place in the digest table.
+        for set in MlDsa::ALL {
+            assert!(signature_scheme(&plain(set.oid())).is_none());
+        }
+    }
+
+    #[test]
+    fn ml_dsa_parameter_sets() {
+        for (oid, set, name) in [
+            (ID_ML_DSA_44, MlDsa::MlDsa44, "44"),
+            (ID_ML_DSA_65, MlDsa::MlDsa65, "65"),
+            (ID_ML_DSA_87, MlDsa::MlDsa87, "87"),
+        ] {
+            assert_eq!(MlDsa::from_algorithm(&plain(oid)), Some(set));
+            assert_eq!(set.oid(), oid);
+            assert_eq!(set.parameter_set(), name);
+        }
+        assert!(MlDsa::from_oid(&PKIXALG_SHA256_WITH_RSA_ENCRYPTION).is_none());
+    }
+
+    #[test]
+    fn ml_dsa_with_parameters_is_declined() {
+        // RFC 9881: the parameters are absent, not NULL.
+        assert!(MlDsa::from_algorithm(&hash_alg(ID_ML_DSA_65)).is_none());
     }
 
     #[test]

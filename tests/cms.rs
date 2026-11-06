@@ -433,6 +433,94 @@ fn imported_keys_without_certificates_sign_requests() {
     }
 }
 
+// ---- ML-DSA, where this Windows' CNG offers it
+
+#[cfg(feature = "pqc")]
+mod cng_ml_dsa {
+    use super::*;
+    use certval_cms::SigningKey;
+    use certval_cng::import_pkcs8_key;
+    use ml_dsa::pkcs8::{EncodePrivateKey, EncodePublicKey};
+    use ml_dsa::{MlDsa44, MlDsa65, MlDsa87};
+    use rand_core::Rng as _;
+    use signature::Keypair;
+
+    /// A software ML-DSA key as PKCS #8, and its certificate.
+    macro_rules! ml_dsa_key {
+        ($params:ty) => {{
+            let mut seed = [0u8; 32];
+            rng().fill_bytes(&mut seed);
+            let key = ml_dsa::SigningKey::<$params>::from_seed(&seed.into());
+            Key {
+                cert: certificate(key.verifying_key().to_public_key_der().unwrap().as_bytes()),
+                pkcs8: key.to_pkcs8_der().unwrap().as_bytes().to_vec(),
+            }
+        }};
+    }
+
+    fn keys() -> [(Key, &'static str); 3] {
+        [
+            (ml_dsa_key!(MlDsa44), "ML-DSA-44"),
+            (ml_dsa_key!(MlDsa65), "ML-DSA-65"),
+            (ml_dsa_key!(MlDsa87), "ML-DSA-87"),
+        ]
+    }
+
+    fn available() -> bool {
+        let available = CngCrypto::ml_dsa_available();
+        if !available {
+            println!("ML-DSA: skipped, this Windows' CNG has no ML-DSA");
+        }
+        available
+    }
+
+    /// Runs `test` on a thread with an 8 MiB stack: software ML-DSA in a debug build exceeds the
+    /// 2 MiB a test thread has by default.
+    fn with_large_stack(test: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(test)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// CNG signs and software verifies, and software signs and CNG alone verifies: SignedData with
+    /// signed attributes, pure ML-DSA over them, SHA-512 for their digest (RFC 9882).
+    #[test]
+    fn signs_and_verifies_with_each_parameter_set() {
+        if !available() {
+            return;
+        }
+        with_large_stack(|| {
+            for (key, name) in keys() {
+                sign_both_ways(&key, |s| s.digest(DigestAlgorithm::Sha512), name);
+            }
+        });
+    }
+
+    /// An ML-DSA key with no certificate signs its own certificate request, its public key the one
+    /// the certificate carries.
+    #[test]
+    fn keys_without_certificates_sign_requests() {
+        if !available() {
+            return;
+        }
+        with_large_stack(|| {
+            for (key, name) in keys() {
+                let imported =
+                    import_pkcs8_key(&key.pkcs8).unwrap_or_else(|e| panic!("{name}: {e}"));
+                assert_eq!(
+                    imported.public_key(),
+                    key.cert.tbs_certificate().subject_public_key_info(),
+                    "{name}"
+                );
+                signs_its_request(&imported, DigestAlgorithm::Sha512, false, name);
+            }
+        });
+    }
+}
+
 #[test]
 fn aes_gcm_and_cbc_are_both_performed() {
     let platform = cng();
