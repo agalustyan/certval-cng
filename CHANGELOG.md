@@ -22,6 +22,13 @@ signing by `CngSigningKey` and `CngKey`, an ML-DSA PKCS #8 key importing into CN
 do. Without CNG's ML-DSA the provider declines it, as before. The `pqc` feature now also enables
 certval-cms's software ML-DSA signing, for the tests.
 
+ML-KEM-512, -768 and -1024, where this Windows' CNG has ML-KEM. `CngCrypto` implements
+certval-cms's `EncryptKem` entirely in CNG: `BCryptEncapsulate`, CNG's HKDF and CNG's AES key wrap.
+`CngRecipientKey` decrypts, decapsulating with `NCryptDecapsulate`, and certval-cms's
+`cek_from_kem_secret` derives the key-encryption key and unwraps. Both entry points are looked up
+at run time, since older Windows' bcrypt.dll and ncrypt.dll lack them;
+`CngCrypto::ml_kem_available()` reports whether CNG has them.
+
 ## [0.1.0-rc.1] - 2026-10-31
 
 Initial release. Calculates SHA-1/256/384/512 digests and verifies RSA PKCS #1 v1.5, RSASSA-PSS and

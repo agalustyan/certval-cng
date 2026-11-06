@@ -115,11 +115,23 @@ public key is the one CNG exports for it, so an EC key need not carry its public
 | Key transport | RSAES-PKCS1-v1_5, RSAES-OAEP with SHA-1/256/384/512, by `BCryptEncrypt` and `NCryptDecrypt` |
 | Key agreement | ECDH on P-256, P-384 and P-521, by `BCryptSecretAgreement` to encrypt and `NCryptSecretAgreement` to decrypt; the X9.63 KDF and AES key wrap by certval-cms |
 | Signing | RSA PKCS #1 v1.5 and RSASSA-PSS, and ECDSA, by `NCryptSignHash`, over a digest the environment computes; pure ML-DSA-44/65/87 with an empty context, by `NCryptSignHash` over the message, where this Windows' CNG has ML-DSA |
-| KEM | declined |
+| KEM | ML-KEM-512/768/1024, where this Windows' CNG has ML-KEM: encryption all by CNG, `BCryptEncapsulate`, CNG's HKDF and AES key wrap; decryption by `NCryptDecapsulate`, then HKDF and AES key unwrap by certval-cms |
 
 CNG has no X9.63 KDF, so for key agreement CNG returns the shared secret (`BCRYPT_KDF_RAW_SECRET`),
 and certval-cms's `wrap_with_ecdh_secret` wraps the content-encryption key or `cek_from_ecdh_secret`
 recovers it; the private key stays in its store.
+
+To encrypt to an ML-KEM recipient, as AWS-LC and OpenSSL do, CNG performs every step:
+`BCryptEncapsulate` to the recipient's key (`BCRYPT_MLKEM_PUBLIC_BLOB`), CNG's HKDF
+(`BCRYPT_HKDF_ALG_HANDLE`, the salt absent) over certval-cms's `CMSORIforKEMOtherInfo` (RFC 9629),
+and CNG's AES key wrap, the content-encryption key exported under the key-encryption key as
+`BCRYPT_AES_WRAP_KEY_BLOB` (which CNG performs only under a key in AES's default CBC mode). To
+decrypt, `NCryptDecapsulate` returns the shared secret, from which certval-cms's
+`cek_from_kem_secret` derives the key-encryption key and unwraps the content-encryption key, as a
+PKCS #11 token's decapsulation does with certval-pkcs11; the private key stays in its store, and
+the shared secret leaves CNG. bcrypt.dll and ncrypt.dll export `BCryptEncapsulate` and
+`NCryptDecapsulate` only where CNG has ML-KEM, so they are looked up at run time rather than
+linked, and `CngCrypto::ml_kem_available()` reports whether both were found.
 
 ## Testing
 
@@ -130,7 +142,10 @@ each checked against certval's software verifier, and each also checked with a c
 changed signature, which must be **rejections**, not refusals. With `cms` and `pqc`, and where this
 Windows' CNG has ML-DSA, ML-DSA-44, -65 and -87 keys made in software are imported into CNG, sign
 SignedData and their own certificate requests, which software verifies, and CNG alone verifies
-SignedData software signs.
+SignedData software signs. Where CNG has ML-KEM, ML-KEM-512, -768 and -1024 keys made in software
+are imported into CNG, with each KDF and key wrap, with and without user keying material, in
+AES-CBC and AES-GCM: CNG alone decrypts what software encrypts to them, and software and CNG each
+decrypt what CNG alone encrypts.
 
 The collection tests verify certificates through the provider and compare against software. No
 certificates are carried in this repository; the collections are named by environment variables, and

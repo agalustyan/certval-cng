@@ -15,7 +15,7 @@
 //! The headers are written field by field rather than by casting the `windows-sys` structs, which
 //! keeps this module free of `unsafe` and buildable, and testable, on any platform.
 
-use crate::algorithm::{MlDsa, Padding};
+use crate::algorithm::{MlDsa, MlKem, Padding};
 use certval::{
     PKIXALG_EC_PUBLIC_KEY, PKIXALG_RSASSA_PSS, PKIXALG_RSA_ENCRYPTION, PKIXALG_SECP256R1,
     PKIXALG_SECP384R1, PKIXALG_SECP521R1,
@@ -44,6 +44,9 @@ pub(crate) const ECDH_PUBLIC_P384_MAGIC: u32 = 0x334B_4345;
 pub(crate) const ECDH_PUBLIC_P521_MAGIC: u32 = 0x354B_4345;
 /// `BCRYPT_MLDSA_PUBLIC_MAGIC`, "DSPK".
 pub(crate) const MLDSA_PUBLIC_MAGIC: u32 = 0x4B50_5344;
+/// `BCRYPT_MLKEM_PUBLIC_MAGIC`, "MLKP".
+#[cfg_attr(not(feature = "cms"), allow(dead_code))]
+pub(crate) const MLKEM_PUBLIC_MAGIC: u32 = 0x504B_4C4D;
 /// `BCRYPT_ECDSA_PUBLIC_GENERIC_MAGIC`, "ECDP": a key of the generic ECDSA algorithm, whose blob
 /// does not name its curve.
 #[cfg_attr(not(feature = "cms"), allow(dead_code))]
@@ -258,14 +261,49 @@ pub(crate) fn ecc_spki_from_blob(blob: &[u8]) -> Option<SubjectPublicKeyInfoOwne
     })
 }
 
-/// An ML-DSA parameter set's name as a `BCRYPT_PQDSA_KEY_BLOB` carries it: UTF-16LE, ending in a
-/// null.
-fn parameter_set_utf16(set: MlDsa) -> Vec<u8> {
-    set.parameter_set()
-        .encode_utf16()
+/// A parameter set's name as a `BCRYPT_PQDSA_KEY_BLOB` or `BCRYPT_MLKEM_KEY_BLOB` carries it:
+/// UTF-16LE, ending in a null.
+fn parameter_set_utf16(name: &str) -> Vec<u8> {
+    name.encode_utf16()
         .chain([0])
         .flat_map(u16::to_le_bytes)
         .collect()
+}
+
+/// A post-quantum key blob: a `BCRYPT_PQDSA_KEY_BLOB` or `BCRYPT_MLKEM_KEY_BLOB` header (`magic`,
+/// the name's length, the key's length), the parameter set's name, then the key.
+fn pq_public_blob(magic: u32, parameter_set: &str, key: &[u8]) -> Option<Vec<u8>> {
+    let name = parameter_set_utf16(parameter_set);
+    let mut blob = Vec::with_capacity(12 + name.len() + key.len());
+    for field in [
+        magic,
+        u32::try_from(name.len()).ok()?,
+        u32::try_from(key.len()).ok()?,
+    ] {
+        blob.extend_from_slice(&field.to_le_bytes());
+    }
+    blob.extend_from_slice(&name);
+    blob.extend_from_slice(key);
+    Some(blob)
+}
+
+/// Builds a `BCRYPT_MLKEM_PUBLIC_BLOB` (the encapsulation blob) for an ML-KEM `spki`, together with
+/// its parameter set. The `SubjectPublicKeyInfo` carries the encapsulation key as it is (RFC 9935),
+/// with no parameters, and its length must be the parameter set's.
+#[cfg_attr(not(feature = "cms"), allow(dead_code))]
+pub(crate) fn ml_kem_public_blob(spki: &SubjectPublicKeyInfoOwned) -> Option<(MlKem, Vec<u8>)> {
+    if spki.algorithm.parameters.is_some() {
+        return None;
+    }
+    let set = MlKem::from_oid(&spki.algorithm.oid)?;
+    let key = spki.subject_public_key.as_bytes()?;
+    if key.len() != set.public_key_len() {
+        return None;
+    }
+    Some((
+        set,
+        pq_public_blob(MLKEM_PUBLIC_MAGIC, set.parameter_set(), key)?,
+    ))
 }
 
 /// Builds a `BCRYPT_PQDSA_PUBLIC_BLOB` for an ML-DSA `spki`, together with its parameter set: a
@@ -278,18 +316,10 @@ pub(crate) fn ml_dsa_public_blob(spki: &SubjectPublicKeyInfoOwned) -> Option<(Ml
     if key.len() != set.public_key_len() {
         return None;
     }
-    let name = parameter_set_utf16(set);
-    let mut blob = Vec::with_capacity(12 + name.len() + key.len());
-    for field in [
-        MLDSA_PUBLIC_MAGIC,
-        u32::try_from(name.len()).ok()?,
-        u32::try_from(key.len()).ok()?,
-    ] {
-        blob.extend_from_slice(&field.to_le_bytes());
-    }
-    blob.extend_from_slice(&name);
-    blob.extend_from_slice(key);
-    Some((set, blob))
+    Some((
+        set,
+        pq_public_blob(MLDSA_PUBLIC_MAGIC, set.parameter_set(), key)?,
+    ))
 }
 
 /// The `SubjectPublicKeyInfo` for a `BCRYPT_PQDSA_PUBLIC_BLOB` of an ML-DSA key, as
@@ -305,7 +335,7 @@ pub(crate) fn ml_dsa_spki_from_blob(blob: &[u8]) -> Option<SubjectPublicKeyInfoO
     let key = blob.get(12 + name_len..12 + name_len + key_len)?;
     let set = MlDsa::ALL
         .into_iter()
-        .find(|set| parameter_set_utf16(*set) == name)?;
+        .find(|set| parameter_set_utf16(set.parameter_set()) == name)?;
     if key.len() != set.public_key_len() {
         return None;
     }
@@ -564,6 +594,42 @@ mod tests {
         assert!(ml_dsa_public_blob(&with_parameters).is_none());
         let (_, blob) = ml_dsa_public_blob(&ml_dsa_spki(MlDsa::MlDsa44, &[0; 1312])).unwrap();
         assert!(ml_dsa_spki_from_blob(&blob[..blob.len() - 1]).is_none());
+    }
+
+    #[test]
+    fn ml_kem_blob_layout() {
+        use const_oid::db::fips203::{ID_ALG_ML_KEM_1024, ID_ALG_ML_KEM_512, ID_ALG_ML_KEM_768};
+        for (oid, name, key_len) in [
+            (ID_ALG_ML_KEM_512, "512", 800),
+            (ID_ALG_ML_KEM_768, "768", 1184),
+            (ID_ALG_ML_KEM_1024, "1024", 1568),
+        ] {
+            let key: Vec<u8> = (0..key_len).map(|i| i as u8).collect();
+            let spki = SubjectPublicKeyInfoOwned {
+                algorithm: AlgorithmIdentifierOwned {
+                    oid,
+                    parameters: None,
+                },
+                subject_public_key: BitString::from_bytes(&key).unwrap(),
+            };
+            let (set, blob) = ml_kem_public_blob(&spki).unwrap();
+            assert_eq!(set.parameter_set(), name);
+            assert_eq!(le(&blob, 0), MLKEM_PUBLIC_MAGIC);
+            // The digits and a null, each a UTF-16 code unit.
+            let name_len = 2 * (name.len() + 1);
+            assert_eq!(le(&blob, 1) as usize, name_len);
+            assert_eq!(le(&blob, 2) as usize, key_len);
+            let utf16: Vec<u8> = name.bytes().flat_map(|b| [b, 0]).chain([0, 0]).collect();
+            assert_eq!(&blob[12..12 + name_len], utf16.as_slice());
+            assert_eq!(&blob[12 + name_len..], key.as_slice());
+            // A key of another parameter set's length, or with parameters, is refused.
+            let mut short = spki.clone();
+            short.subject_public_key = BitString::from_bytes(&key[1..]).unwrap();
+            assert!(ml_kem_public_blob(&short).is_none());
+            let mut with_parameters = spki;
+            with_parameters.algorithm.parameters = Some(Any::null());
+            assert!(ml_kem_public_blob(&with_parameters).is_none());
+        }
     }
 
     #[test]

@@ -11,6 +11,7 @@ use certval::{
     PKIXALG_SHA384, PKIXALG_SHA384_WITH_RSA_ENCRYPTION, PKIXALG_SHA512,
     PKIXALG_SHA512_WITH_RSA_ENCRYPTION,
 };
+use const_oid::db::fips203::{ID_ALG_ML_KEM_1024, ID_ALG_ML_KEM_512, ID_ALG_ML_KEM_768};
 use const_oid::db::fips204::{ID_ML_DSA_44, ID_ML_DSA_65, ID_ML_DSA_87};
 use const_oid::ObjectIdentifier;
 use der::{Decode, Encode};
@@ -81,6 +82,58 @@ impl MlDsa {
     }
 
     pub(crate) const ALL: [MlDsa; 3] = [MlDsa::MlDsa44, MlDsa::MlDsa65, MlDsa::MlDsa87];
+}
+
+/// An ML-KEM parameter set (FIPS 203), for a KEMRecipientInfo (RFC 9629, RFC 9936).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(not(feature = "cms"), allow(dead_code))]
+pub(crate) enum MlKem {
+    MlKem512,
+    MlKem768,
+    MlKem1024,
+}
+
+#[cfg_attr(not(feature = "cms"), allow(dead_code))]
+impl MlKem {
+    /// The parameter set an ML-KEM key's OID names.
+    pub(crate) fn from_oid(oid: &ObjectIdentifier) -> Option<Self> {
+        match *oid {
+            ID_ALG_ML_KEM_512 => Some(MlKem::MlKem512),
+            ID_ALG_ML_KEM_768 => Some(MlKem::MlKem768),
+            ID_ALG_ML_KEM_1024 => Some(MlKem::MlKem1024),
+            _ => None,
+        }
+    }
+
+    /// The name CNG gives the parameter set (`BCRYPT_MLKEM_PARAMETER_SET_*`).
+    pub(crate) fn parameter_set(self) -> &'static str {
+        match self {
+            MlKem::MlKem512 => "512",
+            MlKem::MlKem768 => "768",
+            MlKem::MlKem1024 => "1024",
+        }
+    }
+
+    /// The size in octets of a public (encapsulation) key (FIPS 203, table 3).
+    pub(crate) fn public_key_len(self) -> usize {
+        match self {
+            MlKem::MlKem512 => 800,
+            MlKem::MlKem768 => 1184,
+            MlKem::MlKem1024 => 1568,
+        }
+    }
+
+    /// The size in octets of a ciphertext (FIPS 203, table 3).
+    pub(crate) fn ciphertext_len(self) -> usize {
+        match self {
+            MlKem::MlKem512 => 768,
+            MlKem::MlKem768 => 1088,
+            MlKem::MlKem1024 => 1568,
+        }
+    }
+
+    /// The size in octets of the shared secret, the same for every parameter set (FIPS 203).
+    pub(crate) const SHARED_SECRET_LEN: usize = 32;
 }
 
 /// A hash CNG provides. SHA-224 is absent because CNG has no SHA-224 provider, so SHA-224
@@ -285,6 +338,21 @@ mod tests {
             assert_eq!(set.parameter_set(), name);
         }
         assert!(MlDsa::from_oid(&PKIXALG_SHA256_WITH_RSA_ENCRYPTION).is_none());
+    }
+
+    #[test]
+    fn ml_kem_parameter_sets() {
+        for (oid, set, name, public_key_len, ciphertext_len) in [
+            (ID_ALG_ML_KEM_512, MlKem::MlKem512, "512", 800, 768),
+            (ID_ALG_ML_KEM_768, MlKem::MlKem768, "768", 1184, 1088),
+            (ID_ALG_ML_KEM_1024, MlKem::MlKem1024, "1024", 1568, 1568),
+        ] {
+            assert_eq!(MlKem::from_oid(&oid), Some(set));
+            assert_eq!(set.parameter_set(), name);
+            assert_eq!(set.public_key_len(), public_key_len);
+            assert_eq!(set.ciphertext_len(), ciphertext_len);
+        }
+        assert!(MlKem::from_oid(&ID_ML_DSA_65).is_none());
     }
 
     #[test]

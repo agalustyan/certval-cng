@@ -42,7 +42,8 @@ x509-cert = { version = "0.3.0", default-features = false, optional = true }
 zeroize = { version = "1.8.1", optional = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+# LibraryLoader finds NCryptDecapsulate at run time: ncrypt.dll exports it only where CNG has ML-KEM.
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_LibraryLoader"] }
 
 [dev-dependencies]
 # certval's software RSA, which the tests compare this provider's verdicts against. A dev-dependency,
@@ -61,8 +62,10 @@ rsa = { version = "=0.10.0-rc.21", features = ["encoding"] }
 elliptic-curve = { version = "0.14.3", features = ["arithmetic"] }
 getrandom = { version = "0.4.1", features = ["sys_rng"] }
 rand_core = "0.10.1"
-# The ML-DSA cms tests, under `pqc`: keys generated in software, as PKCS #8 for CNG to import.
+# The ML-DSA and ML-KEM cms tests, under `pqc`: keys generated in software, as PKCS #8 for CNG to
+# import.
 ml-dsa = { version = "0.1.1", features = ["pkcs8"] }
+ml-kem = { version = "0.3.4", features = ["pkcs8"] }
 
 [package.metadata.docs.rs]
 # The provider exists only on Windows.

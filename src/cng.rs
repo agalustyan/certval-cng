@@ -7,8 +7,10 @@
 use crate::algorithm::{Hash, MlDsa, Padding};
 use crate::blob::{ml_dsa_public_blob, Curve};
 use log::debug;
-use windows_sys::core::{w, PCWSTR};
+use std::sync::OnceLock;
+use windows_sys::core::{s, w, PCWSTR};
 use windows_sys::Win32::Foundation::{NTSTATUS, STATUS_INVALID_SIGNATURE};
+use windows_sys::Win32::Security::Cryptography::NCRYPT_KEY_HANDLE;
 use windows_sys::Win32::Security::Cryptography::{
     BCryptDestroyKey, BCryptGetFipsAlgorithmMode, BCryptHash, BCryptImportKeyPair,
     BCryptVerifySignature, BCRYPT_ALG_HANDLE, BCRYPT_ECCPUBLIC_BLOB, BCRYPT_ECDSA_P256_ALG_HANDLE,
@@ -18,6 +20,7 @@ use windows_sys::Win32::Security::Cryptography::{
     BCRYPT_SHA256_ALGORITHM, BCRYPT_SHA256_ALG_HANDLE, BCRYPT_SHA384_ALGORITHM,
     BCRYPT_SHA384_ALG_HANDLE, BCRYPT_SHA512_ALGORITHM, BCRYPT_SHA512_ALG_HANDLE,
 };
+use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 
 fn succeeded(status: NTSTATUS) -> bool {
     status >= 0
@@ -154,6 +157,105 @@ pub(crate) fn import_ecdsa(curve: Curve, blob: &[u8]) -> Option<Key> {
         Curve::P521 => BCRYPT_ECDSA_P521_ALG_HANDLE,
     };
     import(algorithm, BCRYPT_ECCPUBLIC_BLOB, blob)
+}
+
+// ML-KEM. Its entry points are new to ncrypt.dll and bcrypt.dll: a binary that linked them would
+// not even load on a Windows without them, so they are looked up when first needed instead. The
+// other definitions are from the Windows 11 SDK's bcrypt.h (10.0.26100), which windows-sys 0.61
+// does not bind.
+
+/// `BCRYPT_MLKEM_ALG_HANDLE`, the ML-KEM pseudo-handle.
+#[cfg_attr(not(feature = "cms"), allow(dead_code))]
+const MLKEM_ALG_HANDLE: BCRYPT_ALG_HANDLE = 0x0000_0481 as BCRYPT_ALG_HANDLE;
+/// `BCRYPT_MLKEM_PUBLIC_BLOB`, which is also `BCRYPT_MLKEM_ENCAPSULATION_BLOB`.
+#[cfg_attr(not(feature = "cms"), allow(dead_code))]
+const MLKEM_PUBLIC_BLOB: PCWSTR = w!("MLKEMPUBLICBLOB");
+
+/// Imports a `BCRYPT_MLKEM_PUBLIC_BLOB` of an ML-KEM encapsulation key.
+#[cfg_attr(not(feature = "cms"), allow(dead_code))]
+pub(crate) fn import_ml_kem(blob: &[u8]) -> Option<Key> {
+    import(MLKEM_ALG_HANDLE, MLKEM_PUBLIC_BLOB, blob)
+}
+
+/// `name` from the system library `dll`, or `None` where it does not export it.
+///
+/// # Safety
+///
+/// The caller transmutes the result to the signature the SDK declares for `name`.
+unsafe fn system_proc(
+    dll: PCWSTR,
+    name: windows_sys::core::PCSTR,
+) -> Option<unsafe extern "system" fn() -> isize> {
+    // SAFETY: the library is a system one, loaded once and never freed, so the address stays
+    // valid; both names are static strings with a null terminator.
+    unsafe {
+        let module = LoadLibraryW(dll);
+        if module.is_null() {
+            return None;
+        }
+        GetProcAddress(module, name)
+    }
+}
+
+/// `BCryptEncapsulate`, from bcrypt.h.
+pub(crate) type BCryptEncapsulateFn = unsafe extern "system" fn(
+    hkey: BCRYPT_KEY_HANDLE,
+    pb_secret_key: *mut u8,
+    cb_secret_key: u32,
+    pcb_secret_key: *mut u32,
+    pb_cipher_text: *mut u8,
+    cb_cipher_text: u32,
+    pcb_cipher_text: *mut u32,
+    dw_flags: u32,
+) -> NTSTATUS;
+
+/// bcrypt.dll's `BCryptEncapsulate`, or `None` on a Windows whose CNG has no ML-KEM.
+pub(crate) fn bcrypt_encapsulate() -> Option<BCryptEncapsulateFn> {
+    static ENCAPSULATE: OnceLock<Option<BCryptEncapsulateFn>> = OnceLock::new();
+    *ENCAPSULATE.get_or_init(|| {
+        // SAFETY: the address is bcrypt.dll's BCryptEncapsulate, whose signature bcrypt.h
+        // declares as this one.
+        unsafe {
+            let proc = system_proc(w!("bcrypt.dll"), s!("BCryptEncapsulate"))?;
+            Some(std::mem::transmute::<
+                unsafe extern "system" fn() -> isize,
+                BCryptEncapsulateFn,
+            >(proc))
+        }
+    })
+}
+
+/// `NCryptDecapsulate`, from the Windows 11 SDK's ncrypt.h (10.0.26100).
+pub(crate) type NCryptDecapsulateFn = unsafe extern "system" fn(
+    hkey: NCRYPT_KEY_HANDLE,
+    pb_cipher_text: *const u8,
+    cb_cipher_text: u32,
+    pb_secret_key: *mut u8,
+    cb_secret_key: u32,
+    pcb_secret_key: *mut u32,
+    dw_flags: u32,
+) -> i32;
+
+/// ncrypt.dll's `NCryptDecapsulate`, or `None` on a Windows whose CNG has no ML-KEM.
+pub(crate) fn ncrypt_decapsulate() -> Option<NCryptDecapsulateFn> {
+    static DECAPSULATE: OnceLock<Option<NCryptDecapsulateFn>> = OnceLock::new();
+    *DECAPSULATE.get_or_init(|| {
+        // SAFETY: the address is ncrypt.dll's NCryptDecapsulate, whose signature ncrypt.h
+        // declares as this one.
+        unsafe {
+            let proc = system_proc(w!("ncrypt.dll"), s!("NCryptDecapsulate"))?;
+            Some(std::mem::transmute::<
+                unsafe extern "system" fn() -> isize,
+                NCryptDecapsulateFn,
+            >(proc))
+        }
+    })
+}
+
+/// Whether CNG offers ML-KEM: whether bcrypt.dll exports `BCryptEncapsulate` and ncrypt.dll
+/// `NCryptDecapsulate`.
+pub(crate) fn ml_kem_available() -> bool {
+    bcrypt_encapsulate().is_some() && ncrypt_decapsulate().is_some()
 }
 
 /// Imports a `BCRYPT_PQDSA_PUBLIC_BLOB` of an ML-DSA key.

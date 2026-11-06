@@ -51,6 +51,14 @@ impl CngCrypto {
         cng::ml_dsa_available()
     }
 
+    /// Reports whether this Windows' CNG offers ML-KEM (`BCryptEncapsulate` and
+    /// `NCryptDecapsulate`), with which, under the `cms` feature, the provider encrypts to an
+    /// ML-KEM recipient and a `CngRecipientKey` decrypts a KEMRecipientInfo. Without it, both are
+    /// declined, and software encrypts.
+    pub fn ml_kem_available() -> bool {
+        cng::ml_kem_available()
+    }
+
     /// Verifies a pure ML-DSA `signature` over `message`, under the parameter set `set` the
     /// signature algorithm names, which must be the key's.
     fn verify_ml_dsa(

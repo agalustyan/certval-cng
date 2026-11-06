@@ -11,9 +11,10 @@
 use std::sync::Arc;
 
 use certval_cms::{
-    cek_from_ecdh_secret, content_decryption_parameters, recipient_matches, wrap_with_ecdh_secret,
-    CmsEnvironment, ContentEncryptionAlgorithm, ContentEncryptionOutput, ContentParameters,
-    DecryptContent, EncryptContent, EncryptKeyAgreement, EncryptKeyTransport, Error, GcmParameters,
+    cek_from_ecdh_secret, cek_from_kem_secret, content_decryption_parameters, kem_other_info,
+    recipient_matches, wrap_with_ecdh_secret, CmsEnvironment, ContentEncryptionAlgorithm,
+    ContentEncryptionOutput, ContentParameters, DecryptContent, EncryptContent, EncryptKem,
+    EncryptKeyAgreement, EncryptKeyTransport, Error, GcmParameters, KdfAlgorithm, KemOutput,
     KeyAgreeOutput, KeyAgreementAlgorithm, KeyTransportAlgorithm, KeyWrapAlgorithm,
     RecipientCredential, RecipientCredentialSource, Result, SharedRecipientCredential,
     SharedSigningCredential, SigningCredential, SigningCredentialLookup, SigningCredentialSource,
@@ -33,24 +34,27 @@ use windows_sys::Win32::Security::Cryptography::{
     CertCloseStore, CertEnumCertificatesInStore, CertOpenSystemStoreW,
     CryptAcquireCertificatePrivateKey, NCryptDecrypt, NCryptDeriveKey, NCryptExportKey,
     NCryptFreeObject, NCryptGetProperty, NCryptImportKey, NCryptSecretAgreement, NCryptSignHash,
-    BCRYPT_AES_CBC_ALG_HANDLE, BCRYPT_AES_GCM_ALG_HANDLE, BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO,
-    BCRYPT_BLOCK_PADDING, BCRYPT_ECCPUBLIC_BLOB, BCRYPT_ECDH_PUBLIC_P256_MAGIC,
-    BCRYPT_ECDH_PUBLIC_P384_MAGIC, BCRYPT_ECDH_PUBLIC_P521_MAGIC, BCRYPT_KDF_RAW_SECRET,
-    BCRYPT_KEY_HANDLE, BCRYPT_OAEP_PADDING_INFO, BCRYPT_PAD_OAEP, BCRYPT_PAD_PKCS1, BCRYPT_PAD_PSS,
-    BCRYPT_PKCS1_PADDING_INFO, BCRYPT_PSS_PADDING_INFO, BCRYPT_PUBLIC_KEY_BLOB,
-    BCRYPT_RSAPUBLIC_BLOB, BCRYPT_USE_SYSTEM_PREFERRED_RNG, CERT_CONTEXT, CERT_NCRYPT_KEY_SPEC,
-    CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG, NCRYPT_KEY_HANDLE, NCRYPT_PROVIDER_HANDLE_PROPERTY,
-    NCRYPT_PROV_HANDLE, NCRYPT_SECRET_HANDLE,
+    BCRYPT_AES_CBC_ALG_HANDLE, BCRYPT_AES_GCM_ALG_HANDLE, BCRYPT_ALG_HANDLE,
+    BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO, BCRYPT_BLOCK_PADDING, BCRYPT_ECCPUBLIC_BLOB,
+    BCRYPT_ECDH_PUBLIC_P256_MAGIC, BCRYPT_ECDH_PUBLIC_P384_MAGIC, BCRYPT_ECDH_PUBLIC_P521_MAGIC,
+    BCRYPT_KDF_RAW_SECRET, BCRYPT_KEY_HANDLE, BCRYPT_OAEP_PADDING_INFO, BCRYPT_PAD_OAEP,
+    BCRYPT_PAD_PKCS1, BCRYPT_PAD_PSS, BCRYPT_PKCS1_PADDING_INFO, BCRYPT_PSS_PADDING_INFO,
+    BCRYPT_PUBLIC_KEY_BLOB, BCRYPT_RSAPUBLIC_BLOB, BCRYPT_USE_SYSTEM_PREFERRED_RNG, CERT_CONTEXT,
+    CERT_NCRYPT_KEY_SPEC, CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG, NCRYPT_KEY_HANDLE,
+    NCRYPT_PROVIDER_HANDLE_PROPERTY, NCRYPT_PROV_HANDLE, NCRYPT_SECRET_HANDLE,
 };
 use x509_cert::Certificate;
 use zeroize::Zeroizing;
 
-use crate::algorithm::{signature_scheme, Hash, MlDsa, Padding};
+use crate::algorithm::{signature_scheme, Hash, MlDsa, MlKem, Padding};
 use crate::blob::{
-    ecc_public_blob, ecc_spki_from_blob, ml_dsa_spki_from_blob, rsa_public_blob,
-    rsa_spki_from_blob, Curve,
+    ecc_public_blob, ecc_spki_from_blob, ml_dsa_spki_from_blob, ml_kem_public_blob,
+    rsa_public_blob, rsa_spki_from_blob, Curve,
 };
-use crate::cng::{hash_name, import_rsa, PqdsaPaddingInfo, PAD_PQDSA, PQDSA_PUBLIC_BLOB};
+use crate::cng::{
+    bcrypt_encapsulate, hash_name, import_ml_kem, import_rsa, ncrypt_decapsulate, PqdsaPaddingInfo,
+    PAD_PQDSA, PQDSA_PUBLIC_BLOB,
+};
 use crate::CngCrypto;
 
 /// Length in octets of an AES-CBC IV.
@@ -106,6 +110,11 @@ fn aes_key(gcm: bool, key: &[u8]) -> Result<SymmetricKey> {
     } else {
         BCRYPT_AES_CBC_ALG_HANDLE
     };
+    symmetric_key(algorithm, key)
+}
+
+/// A BCrypt key of `algorithm` (a pseudo-handle) made from `secret`.
+fn symmetric_key(algorithm: BCRYPT_ALG_HANDLE, key: &[u8]) -> Result<SymmetricKey> {
     let mut handle: BCRYPT_KEY_HANDLE = std::ptr::null_mut();
     // SAFETY: a null key object lets CNG allocate it; the secret is live with the length passed.
     let status = unsafe {
@@ -124,6 +133,158 @@ fn aes_key(gcm: bool, key: &[u8]) -> Result<SymmetricKey> {
         return Err(Error::Unrecognized);
     }
     Ok(SymmetricKey(handle))
+}
+
+/// HKDF (RFC 5869) by CNG: `len` octets from the input keying material `ikm`, with the salt absent
+/// and `info`, as RFC 9629 has a KEMRecipientInfo's key-encryption key derived.
+fn cng_hkdf(kdf: KdfAlgorithm, ikm: &[u8], info: &[u8], len: usize) -> Result<Zeroizing<Vec<u8>>> {
+    use windows_sys::Win32::Security::Cryptography::{
+        BCryptBuffer, BCryptBufferDesc, BCryptKeyDerivation, BCryptSetProperty,
+        BCRYPTBUFFER_VERSION, BCRYPT_HKDF_ALG_HANDLE, BCRYPT_HKDF_HASH_ALGORITHM,
+        BCRYPT_HKDF_SALT_AND_FINALIZE, KDF_HKDF_INFO,
+    };
+    let hash = match kdf {
+        KdfAlgorithm::HkdfSha256 => "SHA256",
+        KdfAlgorithm::HkdfSha384 => "SHA384",
+        KdfAlgorithm::HkdfSha512 => "SHA512",
+        _ => return Err(Error::Unrecognized),
+    };
+    // The property takes the hash's CNG name as a wide string, its null terminator included.
+    let hash: Vec<u16> = hash.encode_utf16().chain([0]).collect();
+    let key = symmetric_key(BCRYPT_HKDF_ALG_HANDLE, ikm)?;
+    let mut buffer = BCryptBuffer {
+        cbBuffer: len32(info)?,
+        BufferType: KDF_HKDF_INFO,
+        pvBuffer: info.as_ptr().cast_mut().cast(),
+    };
+    let parameters = BCryptBufferDesc {
+        ulVersion: BCRYPTBUFFER_VERSION,
+        cBuffers: 1,
+        pBuffers: &mut buffer,
+    };
+    let mut okm = Zeroizing::new(vec![0u8; len]);
+    let mut written = 0u32;
+    // SAFETY: the key is live; the hash name, the info and the output are live with the lengths
+    // passed; a null salt, which the HKDF property allows, is the absent salt, and BCrypt only
+    // reads the info buffer.
+    let status = unsafe {
+        let status = BCryptSetProperty(
+            key.0,
+            BCRYPT_HKDF_HASH_ALGORITHM,
+            hash.as_ptr().cast(),
+            u32::try_from(hash.len() * 2).unwrap_or(u32::MAX),
+            0,
+        );
+        if !succeeded(status) {
+            status
+        } else {
+            let status =
+                BCryptSetProperty(key.0, BCRYPT_HKDF_SALT_AND_FINALIZE, std::ptr::null(), 0, 0);
+            if !succeeded(status) {
+                status
+            } else {
+                BCryptKeyDerivation(
+                    key.0,
+                    &parameters,
+                    okm.as_mut_ptr(),
+                    len32(&okm)?,
+                    &mut written,
+                    0,
+                )
+            }
+        }
+    };
+    if !succeeded(status) || written as usize != len {
+        debug!("CNG's HKDF declined: {status:#010x}");
+        return Err(Error::Unrecognized);
+    }
+    Ok(okm)
+}
+
+/// AES key wrap (RFC 3394) by CNG: `cek` exported under `kek` as `BCRYPT_AES_WRAP_KEY_BLOB`. The
+/// wrapping key must be in AES's default chaining mode, CBC: CNG refuses the export under an
+/// ECB-mode key (`STATUS_INVALID_PARAMETER`), though the wrap uses no chaining mode of its own.
+fn cng_aes_key_wrap(kek: &[u8], cek: &[u8]) -> Result<Vec<u8>> {
+    use windows_sys::Win32::Security::Cryptography::{BCryptExportKey, BCRYPT_AES_WRAP_KEY_BLOB};
+    let kek = symmetric_key(BCRYPT_AES_CBC_ALG_HANDLE, kek)?;
+    let cek_key = symmetric_key(BCRYPT_AES_CBC_ALG_HANDLE, cek)?;
+    let mut wrapped = vec![0u8; cek.len() + 8];
+    let mut written = 0u32;
+    // SAFETY: both keys are live, and the output is live with the length passed; BCrypt reports
+    // how many octets it wrote.
+    let status = unsafe {
+        BCryptExportKey(
+            cek_key.0,
+            kek.0,
+            BCRYPT_AES_WRAP_KEY_BLOB,
+            wrapped.as_mut_ptr(),
+            len32(&wrapped)?,
+            &mut written,
+            0,
+        )
+    };
+    if !succeeded(status) || written as usize != wrapped.len() {
+        debug!("CNG's AES key wrap declined: {status:#010x}");
+        return Err(Error::Unrecognized);
+    }
+    Ok(wrapped)
+}
+
+impl EncryptKem for CngCrypto {
+    /// ML-KEM-512, -768 or -1024, where this Windows' CNG has ML-KEM, all by CNG:
+    /// `BCryptEncapsulate` to the recipient's key, CNG's HKDF over the `CMSORIforKEMOtherInfo`
+    /// (RFC 9629), and CNG's AES key wrap. The shared secret and key-encryption key pass through
+    /// this process, as they do for AWS-LC and OpenSSL.
+    fn encrypt_kem(
+        &self,
+        _env: &CmsEnvironment,
+        kdf: KdfAlgorithm,
+        wrap: KeyWrapAlgorithm,
+        spki: &SubjectPublicKeyInfoOwned,
+        ukm: Option<&[u8]>,
+        cek: &[u8],
+    ) -> Result<KemOutput> {
+        let Some((set, blob)) = ml_kem_public_blob(spki) else {
+            return Err(Error::Unrecognized);
+        };
+        let Some(encapsulate) = bcrypt_encapsulate() else {
+            return Err(Error::Unrecognized);
+        };
+        let Some(key) = import_ml_kem(&blob) else {
+            return Err(Error::Unrecognized);
+        };
+        let mut ss = Zeroizing::new(vec![0u8; MlKem::SHARED_SECRET_LEN]);
+        let mut ss_len = 0u32;
+        let mut kem_ct = vec![0u8; set.ciphertext_len()];
+        let mut kem_ct_len = 0u32;
+        // SAFETY: the key is live, the function is bcrypt.dll's BCryptEncapsulate, and both outputs
+        // are live with the lengths passed; BCrypt reports how many octets it wrote to each.
+        let status = unsafe {
+            encapsulate(
+                key.handle(),
+                ss.as_mut_ptr(),
+                len32(&ss)?,
+                &mut ss_len,
+                kem_ct.as_mut_ptr(),
+                len32(&kem_ct)?,
+                &mut kem_ct_len,
+                0,
+            )
+        };
+        if !succeeded(status) || ss_len as usize != ss.len() || kem_ct_len as usize != kem_ct.len()
+        {
+            debug!("BCrypt could not encapsulate: {status:#010x}");
+            return Err(Error::Unrecognized);
+        }
+        let info = kem_other_info(wrap, ukm)?;
+        let kek = cng_hkdf(kdf, &ss, &info, wrap.kek_len())?;
+        let encrypted_key = cng_aes_key_wrap(&kek, cek)?;
+        trace!("CNG performed a {set:?} KEM with {kdf:?} and {wrap:?}");
+        Ok(KemOutput {
+            kem_ct,
+            encrypted_key,
+        })
+    }
 }
 
 /// AES-CBC with PKCS #7 padding; `None` if BCrypt refuses, including malformed padding on
@@ -744,6 +905,55 @@ impl RecipientCredential for CngRecipientKey {
         z.reverse();
         let cek = cek_from_ecdh_secret(alg, wrap, &z, ukm, encrypted_key)?;
         trace!("CNG decrypted a key agreement with {alg:?} and {wrap:?}");
+        Ok(cek)
+    }
+
+    /// ML-KEM-512, -768 or -1024: `NCryptDecapsulate` recovers the shared secret, from which
+    /// certval-cms's `cek_from_kem_secret` derives the key-encryption key and unwraps the
+    /// content-encryption key. The shared secret therefore leaves CNG, as it leaves a PKCS #11
+    /// token.
+    fn decrypt_kem(
+        &self,
+        _env: &CmsEnvironment,
+        kdf: KdfAlgorithm,
+        wrap: KeyWrapAlgorithm,
+        kem_ct: &[u8],
+        ukm: Option<&[u8]>,
+        encrypted_key: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        let Some(set) = MlKem::from_oid(&self.key_algorithm()) else {
+            return Err(Error::Unrecognized);
+        };
+        let Some(decapsulate) = ncrypt_decapsulate() else {
+            return Err(Error::Unrecognized);
+        };
+        if kem_ct.len() != set.ciphertext_len() {
+            return Err(Error::Crypto(String::from(
+                "the KEM ciphertext is not the recipient's parameter set's length",
+            )));
+        }
+        let mut ss = Zeroizing::new(vec![0u8; MlKem::SHARED_SECRET_LEN]);
+        let mut written = 0u32;
+        // SAFETY: the key is live, the function is ncrypt.dll's NCryptDecapsulate, and both buffers
+        // are live with the lengths passed; NCrypt reports how many octets it wrote.
+        let status = unsafe {
+            decapsulate(
+                self.key.0,
+                kem_ct.as_ptr(),
+                len32(kem_ct)?,
+                ss.as_mut_ptr(),
+                len32(&ss)?,
+                &mut written,
+                0,
+            )
+        };
+        if !succeeded(status) {
+            debug!("NCrypt could not decapsulate: {status:#010x}");
+            return Err(Error::Crypto(String::from("KEM decapsulation failed")));
+        }
+        ss.truncate(written as usize);
+        let cek = cek_from_kem_secret(kdf, wrap, &ss, ukm, encrypted_key)?;
+        trace!("CNG decapsulated a {set:?} KEM with {kdf:?} and {wrap:?}");
         Ok(cek)
     }
 }
