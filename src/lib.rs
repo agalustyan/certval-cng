@@ -57,6 +57,7 @@
 //! on. [`CngCrypto::fips_mode_enabled`] reports the setting so a caller that depends on it can
 //! check it.
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
