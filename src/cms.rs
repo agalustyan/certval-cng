@@ -29,15 +29,16 @@ use spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
 use windows_sys::core::{w, PCWSTR};
 use windows_sys::Win32::Security::Cryptography::{
     BCryptDecrypt, BCryptDestroyKey, BCryptEncrypt, BCryptGenRandom, BCryptGenerateSymmetricKey,
-    CertCloseStore, CertEnumCertificatesInStore, CertOpenSystemStoreW,
-    CryptAcquireCertificatePrivateKey, NCryptDecrypt, NCryptDeriveKey, NCryptFreeObject,
-    NCryptGetProperty, NCryptImportKey, NCryptSecretAgreement, NCryptSignHash,
+    CertCloseStore, CertEnumCertificatesInStore, CertGetCertificateContextProperty,
+    CertOpenSystemStoreW, CryptAcquireCertificatePrivateKey, NCryptDecrypt, NCryptDeriveKey,
+    NCryptFreeObject, NCryptGetProperty, NCryptImportKey, NCryptSecretAgreement, NCryptSignHash,
     BCRYPT_AES_CBC_ALG_HANDLE, BCRYPT_AES_GCM_ALG_HANDLE, BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO,
     BCRYPT_BLOCK_PADDING, BCRYPT_ECCPUBLIC_BLOB, BCRYPT_ECDH_PUBLIC_P256_MAGIC,
     BCRYPT_ECDH_PUBLIC_P384_MAGIC, BCRYPT_ECDH_PUBLIC_P521_MAGIC, BCRYPT_KDF_RAW_SECRET,
     BCRYPT_KEY_HANDLE, BCRYPT_OAEP_PADDING_INFO, BCRYPT_PAD_OAEP, BCRYPT_PAD_PKCS1, BCRYPT_PAD_PSS,
     BCRYPT_PKCS1_PADDING_INFO, BCRYPT_PSS_PADDING_INFO, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-    CERT_CONTEXT, CERT_NCRYPT_KEY_SPEC, CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG, NCRYPT_KEY_HANDLE,
+    CERT_CONTEXT, CERT_KEY_PROV_INFO_PROP_ID, CERT_NCRYPT_KEY_SPEC,
+    CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG, CRYPT_ACQUIRE_SILENT_FLAG, NCRYPT_KEY_HANDLE,
     NCRYPT_PROVIDER_HANDLE_PROPERTY, NCRYPT_PROV_HANDLE, NCRYPT_SECRET_HANDLE,
 };
 use x509_cert::Certificate;
@@ -859,11 +860,9 @@ impl CertStoreIdentities {
         Self::default()
     }
 
-    /// Every certificate in the store that `matches` and has an NCrypt private key, with that key.
-    fn find(
-        &self,
-        matches: impl Fn(&Certificate) -> bool,
-    ) -> Result<Vec<(Certificate, NcryptKey)>> {
+    /// Calls `visit` with each certificate in the store that decodes, and its context, which is
+    /// live for the call.
+    fn visit(mut visit: impl FnMut(Certificate, *const CERT_CONTEXT)) -> Result<()> {
         const MY: PCWSTR = w!("MY");
         // SAFETY: a zero provider is the default; the store is closed below.
         let store = unsafe { CertOpenSystemStoreW(0, MY) };
@@ -872,7 +871,6 @@ impl CertStoreIdentities {
                 "the certificate store could not be opened",
             )));
         }
-        let mut found = vec![];
         let mut context: *mut CERT_CONTEXT = std::ptr::null_mut();
         loop {
             // SAFETY: the store is open; enumeration frees the previous context.
@@ -888,11 +886,26 @@ impl CertStoreIdentities {
                     (*context).cbCertEncoded as usize,
                 )
             };
-            let Ok(certificate) = Certificate::from_der(encoded) else {
-                continue;
-            };
+            if let Ok(certificate) = Certificate::from_der(encoded) {
+                visit(certificate, context);
+            }
+        }
+        // SAFETY: the store is closed once.
+        unsafe { CertCloseStore(store, 0) };
+        Ok(())
+    }
+
+    /// Every certificate in the store that `matches` and has an NCrypt private key, with that key.
+    /// The key is opened silently: one whose provider would put up a dialog to open it, e.g. for a
+    /// smart card that is not inserted, is passed over.
+    fn find(
+        &self,
+        matches: impl Fn(&Certificate) -> bool,
+    ) -> Result<Vec<(Certificate, NcryptKey)>> {
+        let mut found = vec![];
+        Self::visit(|certificate, context| {
             if !matches(&certificate) {
-                continue;
+                return;
             }
             let mut key = 0usize;
             let mut key_spec = 0u32;
@@ -901,7 +914,7 @@ impl CertStoreIdentities {
             let acquired = unsafe {
                 CryptAcquireCertificatePrivateKey(
                     context,
-                    CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG,
+                    CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG | CRYPT_ACQUIRE_SILENT_FLAG,
                     std::ptr::null(),
                     &mut key,
                     &mut key_spec,
@@ -909,19 +922,36 @@ impl CertStoreIdentities {
                 )
             };
             if acquired == 0 || key_spec != CERT_NCRYPT_KEY_SPEC || caller_frees == 0 {
-                continue;
+                return;
             }
             found.push((certificate, NcryptKey(key)));
-        }
-        // SAFETY: the store is closed once.
-        unsafe { CertCloseStore(store, 0) };
+        })?;
         Ok(found)
     }
 
-    /// Every certificate in the store with an NCrypt private key, for a caller to list or choose
-    /// among. A credential for one is found through either source interface, by its identifier.
+    /// Every certificate in the store with a private key reference, for a caller to list or choose
+    /// among. No key is opened, so the list is made without dialogs and holds certificates whose
+    /// keys are on smart cards not inserted; whether a key opens is learned when a credential for
+    /// its certificate is found through either source interface, by its identifier.
     pub fn certificates(&self) -> Result<Vec<Certificate>> {
-        Ok(self.find(|_| true)?.into_iter().map(|(c, _)| c).collect())
+        let mut found = vec![];
+        Self::visit(|certificate, context| {
+            let mut size = 0u32;
+            // SAFETY: the context is live; with no buffer, the call reports whether the property
+            // is present and its size.
+            let has_key = unsafe {
+                CertGetCertificateContextProperty(
+                    context,
+                    CERT_KEY_PROV_INFO_PROP_ID,
+                    std::ptr::null_mut(),
+                    &mut size,
+                )
+            } != 0;
+            if has_key {
+                found.push(certificate);
+            }
+        })?;
+        Ok(found)
     }
 }
 
