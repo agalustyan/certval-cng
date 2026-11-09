@@ -389,10 +389,31 @@ impl EncryptKeyTransport for CngCrypto {
         } else {
             std::ptr::null()
         };
-        let mut output = vec![0u8; 1024];
+        let mut needed = 0u32;
+        // SAFETY: the key is live and the padding info outlives the call; with no output buffer,
+        // BCrypt reports the length the encrypted key needs, the modulus's.
+        let status = unsafe {
+            BCryptEncrypt(
+                key.handle(),
+                cek.as_ptr(),
+                len32(cek)?,
+                info_ptr,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut needed,
+                flag,
+            )
+        };
+        if !succeeded(status) {
+            debug!("BCrypt declined key transport: {status:#010x}");
+            return Err(Error::Unrecognized);
+        }
+        let mut output = vec![0u8; needed as usize];
         let mut written = 0u32;
-        // SAFETY: the key is live, the padding info outlives the call, and BCrypt writes at most
-        // the output's length, reporting how many octets.
+        // SAFETY: as above, and BCrypt writes at most the output's length, reporting how many
+        // octets.
         let status = unsafe {
             BCryptEncrypt(
                 key.handle(),
@@ -810,10 +831,29 @@ impl SigningCredential for CngSigningKey {
             ),
             Padding::Ecdsa => (std::ptr::null(), 0),
         };
-        let mut signature = vec![0u8; 1024];
+        let mut needed = 0u32;
+        // SAFETY: the key is live and the padding info outlives the call; with no signature
+        // buffer, NCrypt reports the length the signature needs, from the key's size.
+        let status = unsafe {
+            NCryptSignHash(
+                self.key.0,
+                info,
+                digest.as_ptr(),
+                len32(digest)?,
+                std::ptr::null_mut(),
+                0,
+                &mut needed,
+                flag,
+            )
+        };
+        if !succeeded(status) {
+            debug!("NCrypt could not size a signature: {status:#010x}");
+            return Err(Error::Crypto(String::from("signing failed")));
+        }
+        let mut signature = vec![0u8; needed as usize];
         let mut written = 0u32;
-        // SAFETY: the key is live, the padding info outlives the call, and NCrypt writes at most
-        // the signature buffer's length, reporting how many octets.
+        // SAFETY: as above, and NCrypt writes at most the signature buffer's length, reporting
+        // how many octets.
         let status = unsafe {
             NCryptSignHash(
                 self.key.0,
