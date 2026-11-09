@@ -170,7 +170,7 @@ macro_rules! ec_key {
 fn envelop<'e>(
     env: &'e CmsEnvironment,
     alg: ContentEncryptionAlgorithm,
-    recipient: impl cms::builder::RecipientInfoBuilder<Rng = Rng> + 'e,
+    recipient: impl certval_cms::RecipientInfoBuilder<Rng = Rng> + 'e,
 ) -> ContentInfo {
     if alg.is_authenticated() {
         certval_cms::AuthEnvelopedDataBuilder::new(MESSAGE, alg)
@@ -381,6 +381,7 @@ fn signs_its_request(
     let platform = cng();
     let signer = if pss {
         CredentialSigner::with_algorithm(&platform, key, digest, rsa_pss(digest).unwrap())
+            .unwrap_or_else(|e| panic!("{name}: {e}"))
     } else {
         CredentialSigner::new(&platform, key, digest).unwrap_or_else(|e| panic!("{name}: {e}"))
     };

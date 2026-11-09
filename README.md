@@ -184,8 +184,7 @@ and -87 PKITS collections: CNG answered all 390 verifications software accepted 
 disagreements. Whether GitHub's hosted runner has ML-DSA in CNG decides whether CI exercises it or
 the fall-through to software.
 
-The `cms` feature has been type-checked for Windows but not yet run; its tests run first in Windows
-CI.
+The `cms` feature's tests run in Windows CI.
 
 certval-cms is not on crates.io yet, so `Cargo.toml`'s `[patch.crates-io]` takes it from a
 neighboring checkout (`../certval-cms`), and CI checks it out there. Both go when it publishes, and

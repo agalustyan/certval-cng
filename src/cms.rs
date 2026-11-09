@@ -29,6 +29,9 @@ use der::{
 use log::{debug, trace};
 use spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
 use windows_sys::core::{w, PCWSTR};
+use windows_sys::Win32::Foundation::{
+    NTSTATUS, STATUS_AUTH_TAG_MISMATCH, STATUS_INVALID_PARAMETER,
+};
 use windows_sys::Win32::Security::Cryptography::{
     BCryptDecrypt, BCryptDestroyKey, BCryptEncrypt, BCryptGenRandom, BCryptGenerateSymmetricKey,
     CertCloseStore, CertEnumCertificatesInStore, CertGetCertificateContextProperty,
@@ -290,14 +293,20 @@ impl EncryptKem for CngCrypto {
 
 /// AES-CBC with PKCS #7 padding; `None` if BCrypt refuses, including malformed padding on
 /// decryption.
-fn cbc(encrypt: bool, key: &SymmetricKey, iv: &[u8], input: &[u8]) -> Option<Vec<u8>> {
+/// AES-CBC with PKCS #7 padding, or the status BCrypt returned.
+fn cbc(
+    encrypt: bool,
+    key: &SymmetricKey,
+    iv: &[u8],
+    input: &[u8],
+) -> core::result::Result<Vec<u8>, NTSTATUS> {
     let mut iv = iv.to_vec();
     let mut output = vec![0u8; input.len() + CBC_IV_LEN];
     let mut written = 0u32;
     let (input_len, output_len, iv_len) = (
-        u32::try_from(input.len()).ok()?,
-        u32::try_from(output.len()).ok()?,
-        u32::try_from(iv.len()).ok()?,
+        u32::try_from(input.len()).map_err(|_| STATUS_INVALID_PARAMETER)?,
+        u32::try_from(output.len()).map_err(|_| STATUS_INVALID_PARAMETER)?,
+        u32::try_from(iv.len()).map_err(|_| STATUS_INVALID_PARAMETER)?,
     );
     // SAFETY: every buffer is live with the length passed; BCrypt updates the IV copy in place and
     // writes at most `output_len` octets, reporting how many.
@@ -332,14 +341,16 @@ fn cbc(encrypt: bool, key: &SymmetricKey, iv: &[u8], input: &[u8]) -> Option<Vec
     };
     if !succeeded(status) {
         debug!("BCrypt AES-CBC failed: {status:#010x}");
-        return None;
+        return Err(status);
     }
     output.truncate(written as usize);
-    Some(output)
+    Ok(output)
 }
 
 /// AES-GCM. On encryption `tag` receives the tag; on decryption it is checked. `None` if BCrypt
 /// refuses, including a tag that does not verify.
+/// AES-GCM, or the status BCrypt returned: `STATUS_AUTH_TAG_MISMATCH` when it checked the tag and
+/// found it wrong, another status for a parameter it refused.
 fn gcm(
     encrypt: bool,
     key: &SymmetricKey,
@@ -347,28 +358,26 @@ fn gcm(
     aad: &[u8],
     tag: &mut [u8],
     input: &[u8],
-) -> Option<Vec<u8>> {
+) -> core::result::Result<Vec<u8>, NTSTATUS> {
+    let len32 = |n: usize| u32::try_from(n).map_err(|_| STATUS_INVALID_PARAMETER);
     let mut output = vec![0u8; input.len()];
     let mut written = 0u32;
     let info = BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO {
-        cbSize: u32::try_from(std::mem::size_of::<BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO>()).ok()?,
+        cbSize: len32(std::mem::size_of::<BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO>())?,
         dwInfoVersion: 1,
         pbNonce: nonce.as_ptr().cast_mut(),
-        cbNonce: u32::try_from(nonce.len()).ok()?,
+        cbNonce: len32(nonce.len())?,
         pbAuthData: aad.as_ptr().cast_mut(),
-        cbAuthData: u32::try_from(aad.len()).ok()?,
+        cbAuthData: len32(aad.len())?,
         pbTag: tag.as_mut_ptr(),
-        cbTag: u32::try_from(tag.len()).ok()?,
+        cbTag: len32(tag.len())?,
         pbMacContext: std::ptr::null_mut(),
         cbMacContext: 0,
         cbAAD: 0,
         cbData: 0,
         dwFlags: 0,
     };
-    let (input_len, output_len) = (
-        u32::try_from(input.len()).ok()?,
-        u32::try_from(output.len()).ok()?,
-    );
+    let (input_len, output_len) = (len32(input.len())?, len32(output.len())?);
     // SAFETY: the mode info and every buffer it points to are live for the call; BCrypt writes at
     // most `output_len` octets, and on encryption the tag.
     let status = unsafe {
@@ -402,10 +411,10 @@ fn gcm(
     };
     if !succeeded(status) {
         debug!("BCrypt AES-GCM failed: {status:#010x}");
-        return None;
+        return Err(status);
     }
     output.truncate(written as usize);
-    Some(output)
+    Ok(output)
 }
 
 impl EncryptContent for CngCrypto {
@@ -435,7 +444,7 @@ impl EncryptContent for CngCrypto {
                 &mut tag,
                 plaintext,
             )
-            .ok_or_else(|| Error::Crypto(String::from("content encryption failed")))?;
+            .map_err(|_| Error::Crypto(String::from("content encryption failed")))?;
             let params = GcmParameters {
                 nonce: OctetString::new(nonce.as_slice())?,
                 icv_len: GCM_TAG_LEN as u8,
@@ -452,7 +461,7 @@ impl EncryptContent for CngCrypto {
         } else {
             let iv = random(CBC_IV_LEN)?;
             let ciphertext = cbc(true, &handle, &iv, plaintext)
-                .ok_or_else(|| Error::Crypto(String::from("content encryption failed")))?;
+                .map_err(|_| Error::Crypto(String::from("content encryption failed")))?;
             ContentEncryptionOutput {
                 ciphertext,
                 key,
@@ -492,11 +501,22 @@ impl DecryptContent for CngCrypto {
                     &mut tag,
                     ciphertext,
                 )
+                .map_err(|status| {
+                    // A tag BCrypt checked and found wrong is the verdict; a parameter it
+                    // refused, e.g. a nonce of a length it does not take, is a decline, for
+                    // another implementation to take up.
+                    if status == STATUS_AUTH_TAG_MISMATCH {
+                        content_decryption_failed()
+                    } else {
+                        Error::Unrecognized
+                    }
+                })?
             }
-            (ContentParameters::Cbc { iv }, None) => cbc(false, &handle, &iv, ciphertext),
+            (ContentParameters::Cbc { iv }, None) => {
+                cbc(false, &handle, &iv, ciphertext).map_err(|_| content_decryption_failed())?
+            }
             _ => return Err(Error::Unrecognized),
-        }
-        .ok_or_else(content_decryption_failed)?;
+        };
         trace!("CNG decrypted content with {content_alg:?}");
         Ok(Zeroizing::new(plaintext))
     }
@@ -1341,7 +1361,16 @@ impl CertStoreIdentities {
                     &mut caller_frees,
                 )
             };
-            if acquired == 0 || key_spec != CERT_NCRYPT_KEY_SPEC || caller_frees == 0 {
+            if acquired == 0 || key_spec != CERT_NCRYPT_KEY_SPEC {
+                return;
+            }
+            if caller_frees == 0 {
+                // The handle is the certificate context's and goes with it, so it cannot be
+                // held past this call.
+                debug!(
+                    "passing over a certificate whose key handle the store owns: {}",
+                    certificate.tbs_certificate().subject()
+                );
                 return;
             }
             found.push((certificate, NcryptKey(key)));

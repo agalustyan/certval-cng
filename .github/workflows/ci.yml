@@ -87,6 +87,25 @@ jobs:
       - run: cargo clippy --all-targets
       - run: cargo clippy --all-targets --all-features
 
+  # docs.rs builds with nightly and --cfg docsrs, which turns on doc_cfg's feature badges; the same
+  # build here catches broken intra-doc links before publication.
+  docs:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: certval-cng
+      # certval-cms is not on crates.io yet, so Cargo.toml's [patch.crates-io] takes it from a
+      # neighboring checkout, which this is. Both go once it publishes.
+      - uses: actions/checkout@v7
+        with:
+          repository: carl-wallace/certval-cms
+          path: certval-cms
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: --cfg docsrs -D warnings
+
   # A job of its own so it can be a required check without making clippy one: each Rust release
   # adds lints, and a required clippy would fail unrelated pull requests.
   rustfmt:
@@ -115,12 +134,12 @@ jobs:
           path: certval-cms
       # The certificate collections live in rust-pki's test data and are pointed at rather than
       # copied, which is what the environment variables below are for. Pinned to the commit the
-      # certval release in Cargo.toml was published from (certval-v0.2.0-rc.1), so the certificates
+      # certval release in Cargo.toml was published from (certval-v0.2.0-rc.2), so the certificates
       # and the library under test stay in lockstep; bump both together.
       - uses: actions/checkout@v7
         with:
           repository: carl-wallace/rust-pki
-          ref: 93104f49a8083f1e527e3b4e830581b917674e2f
+          ref: 8eb10cbc236bf18d7147a3e8d7924f89ba37dd57
           path: rust-pki
       - uses: dtolnay/rust-toolchain@stable
 
