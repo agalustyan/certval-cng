@@ -168,7 +168,7 @@ macro_rules! ec_key {
 fn envelop<'e>(
     env: &'e CmsEnvironment,
     alg: ContentEncryptionAlgorithm,
-    recipient: impl cms::builder::RecipientInfoBuilder<Rng = Rng> + 'e,
+    recipient: impl certval_cms::RecipientInfoBuilder<Rng = Rng> + 'e,
 ) -> ContentInfo {
     if alg.is_authenticated() {
         certval_cms::AuthEnvelopedDataBuilder::new(MESSAGE, alg)
