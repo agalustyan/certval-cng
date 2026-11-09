@@ -93,8 +93,9 @@ With the `cms` feature, `CngCrypto` also implements
 key transport, and NCrypt keys serve as credentials: `CngRecipientKey` decrypts, `CngSigningKey`
 signs, and `CertStoreIdentities` finds both in the current user's personal certificate store, where
 CAPI and virtual smart card keys are: a decryption key by the recipient identifier a message
-contains, and signing keys by signer identifier, email address or subject, and `certificates()`
-lists them. `import_pkcs8` makes both for a key imported into the Microsoft Software Key Storage Provider.
+contains, and signing keys by signer identifier, email address or subject, each key opened silently
+so that no dialog interrupts a lookup, and `certificates()` lists them without opening any key.
+`import_pkcs8` makes both for a key imported into the Microsoft Software Key Storage Provider.
 
 | Operation | Coverage |
 |---|---|
