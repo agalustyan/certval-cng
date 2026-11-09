@@ -20,7 +20,9 @@ use windows_sys::Win32::Security::Cryptography::{
     BCRYPT_SHA256_ALGORITHM, BCRYPT_SHA256_ALG_HANDLE, BCRYPT_SHA384_ALGORITHM,
     BCRYPT_SHA384_ALG_HANDLE, BCRYPT_SHA512_ALGORITHM, BCRYPT_SHA512_ALG_HANDLE,
 };
-use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows_sys::Win32::System::LibraryLoader::{
+    GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
+};
 
 fn succeeded(status: NTSTATUS) -> bool {
     status >= 0
@@ -187,9 +189,10 @@ unsafe fn system_proc(
     name: windows_sys::core::PCSTR,
 ) -> Option<unsafe extern "system" fn() -> isize> {
     // SAFETY: the library is a system one, loaded once and never freed, so the address stays
-    // valid; both names are static strings with a null terminator.
+    // valid; both names are static strings with a null terminator. The search is confined to
+    // System32, so a library of the same name beside the executable is never the one loaded.
     unsafe {
-        let module = LoadLibraryW(dll);
+        let module = LoadLibraryExW(dll, std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32);
         if module.is_null() {
             return None;
         }
@@ -264,19 +267,25 @@ pub(crate) fn import_ml_dsa(blob: &[u8]) -> Option<Key> {
 }
 
 /// Whether CNG offers ML-DSA, as recent Windows 11 builds do: whether it imports a public key of
-/// each parameter set. A public key is any string of bytes of the right
-/// length, so one of zeros serves.
+/// each parameter set, found out once. A public key is any string of bytes of the right length,
+/// so one of zeros serves.
 pub(crate) fn ml_dsa_available() -> bool {
-    MlDsa::ALL.into_iter().all(|set| {
-        let spki = spki::SubjectPublicKeyInfoOwned {
-            algorithm: spki::AlgorithmIdentifierOwned {
-                oid: set.oid(),
-                parameters: None,
-            },
-            subject_public_key: der::asn1::BitString::from_bytes(&vec![0; set.public_key_len()])
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        MlDsa::ALL.into_iter().all(|set| {
+            let spki = spki::SubjectPublicKeyInfoOwned {
+                algorithm: spki::AlgorithmIdentifierOwned {
+                    oid: set.oid(),
+                    parameters: None,
+                },
+                subject_public_key: der::asn1::BitString::from_bytes(&vec![
+                    0;
+                    set.public_key_len()
+                ])
                 .expect("a bit string of whole octets"),
-        };
-        ml_dsa_public_blob(&spki).is_some_and(|(_, blob)| import_ml_dsa(&blob).is_some())
+            };
+            ml_dsa_public_blob(&spki).is_some_and(|(_, blob)| import_ml_dsa(&blob).is_some())
+        })
     })
 }
 
