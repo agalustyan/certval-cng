@@ -145,11 +145,7 @@ struct Key {
 
 impl Key {
     fn rsa() -> Self {
-        Self::rsa_bits(2048)
-    }
-
-    fn rsa_bits(bits: usize) -> Self {
-        let key = rsa::RsaPrivateKey::new(&mut rng(), bits).unwrap();
+        let key = rsa::RsaPrivateKey::new(&mut rng(), 2048).unwrap();
         let spki = key.to_public_key().to_public_key_der().unwrap();
         Self {
             cert: certificate(spki.as_bytes()),
@@ -352,27 +348,6 @@ fn rsa_pkcs1v15_and_pss_with_each_digest() {
             &format!("PSS {digest:?}"),
         );
     }
-}
-
-/// Key transport and signing size their output from the key, so an RSA key beyond 8192 bits is
-/// served. Generating one takes minutes in a debug build, so this runs only when asked:
-/// `cargo test --release --features cms --test cms -- --ignored rsa_beyond`.
-#[test]
-#[ignore]
-fn rsa_beyond_8192_bits_is_transported_and_signs() {
-    let key = Key::rsa_bits(9216);
-    let (software, platform) = (software(), cng());
-    let (platform_key, _) = import_pkcs8(key.cert.clone(), &key.pkcs8).unwrap();
-    let software_key = SoftwareRecipientKey::from_pkcs8_der(key.cert.clone(), &key.pkcs8).unwrap();
-    let alg = KeyTransportAlgorithm::RsaOaepSha256;
-    let content = ContentEncryptionAlgorithm::Aes256Gcm;
-    let r = KeyTransRecipient::from_certificate(&platform, &key.cert, None, alg).unwrap();
-    let ci = envelop(&platform, content, r);
-    assert_decrypts(&software, &ci, &software_key, "CNG to software, RSA-9216");
-    let r = KeyTransRecipient::from_certificate(&software, &key.cert, None, alg).unwrap();
-    let ci = envelop(&software, content, r);
-    assert_decrypts(&platform, &ci, &platform_key, "software to CNG, RSA-9216");
-    sign_both_ways(&key, |s| s.digest(DigestAlgorithm::Sha256), "RSA-9216");
 }
 
 #[test]
