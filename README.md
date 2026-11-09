@@ -148,8 +148,7 @@ Run in CI on GitHub's hosted Windows runner against rust-pki's PKITS collections
 disagreements in either interface, and declined every ML-DSA one. Changed messages and changed
 signatures were rejections, not refusals. The runner was not in FIPS-approved mode.
 
-The `cms` feature has been type-checked for Windows but not yet run; its tests run first in Windows
-CI.
+The `cms` feature's tests run in Windows CI.
 
 certval-cms is not on crates.io yet, so `Cargo.toml`'s `[patch.crates-io]` takes it from a
 neighboring checkout (`../certval-cms`), and CI checks it out there. Both go when it publishes, and
