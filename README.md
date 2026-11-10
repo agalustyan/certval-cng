@@ -103,7 +103,9 @@ signs, and `CertStoreIdentities` finds both in the current user's personal certi
 CAPI and virtual smart card keys are: a decryption key by the recipient identifier a message
 contains, and signing keys by signer identifier, email address or subject, each key opened silently
 so that no dialog interrupts a lookup, and `certificates()` lists them without opening any key.
-`import_pkcs8` makes both for a key imported into the Microsoft Software Key Storage Provider.
+`import_pkcs8` makes both for a key imported into the Microsoft Software Key Storage Provider; an
+ML-KEM key, whose PKCS #8 form the provider does not import, goes in as CNG's own seed or
+decapsulation-key blob, in whichever of RFC 9935's forms the PKCS #8 holds it.
 
 A key with no certificate yet, e.g. one signing its own certificate request or a self-signed
 certificate, is certval-cms's `SigningKey`: `CngKey`, which `import_pkcs8_key` makes from a PKCS #8

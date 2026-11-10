@@ -47,6 +47,12 @@ pub(crate) const MLDSA_PUBLIC_MAGIC: u32 = 0x4B50_5344;
 /// `BCRYPT_MLKEM_PUBLIC_MAGIC`, "MLKP".
 #[cfg_attr(not(feature = "cms"), allow(dead_code))]
 pub(crate) const MLKEM_PUBLIC_MAGIC: u32 = 0x504B_4C4D;
+/// `BCRYPT_MLKEM_PRIVATE_MAGIC`, "MLKR": an expanded decapsulation key.
+#[cfg_attr(not(feature = "cms"), allow(dead_code))]
+pub(crate) const MLKEM_PRIVATE_MAGIC: u32 = 0x524B_4C4D;
+/// `BCRYPT_MLKEM_PRIVATE_SEED_MAGIC`, "MLKS": the seed `d ‖ z` a key pair is generated from.
+#[cfg_attr(not(feature = "cms"), allow(dead_code))]
+pub(crate) const MLKEM_PRIVATE_SEED_MAGIC: u32 = 0x534B_4C4D;
 /// `BCRYPT_ECDSA_PUBLIC_GENERIC_MAGIC`, "ECDP": a key of the generic ECDSA algorithm, whose blob
 /// does not name its curve.
 #[cfg_attr(not(feature = "cms"), allow(dead_code))]
@@ -272,7 +278,7 @@ fn parameter_set_utf16(name: &str) -> Vec<u8> {
 
 /// A post-quantum key blob: a `BCRYPT_PQDSA_KEY_BLOB` or `BCRYPT_MLKEM_KEY_BLOB` header (`magic`,
 /// the name's length, the key's length), the parameter set's name, then the key.
-fn pq_public_blob(magic: u32, parameter_set: &str, key: &[u8]) -> Option<Vec<u8>> {
+fn pq_key_blob(magic: u32, parameter_set: &str, key: &[u8]) -> Option<Vec<u8>> {
     let name = parameter_set_utf16(parameter_set);
     let mut blob = Vec::with_capacity(12 + name.len() + key.len());
     for field in [
@@ -302,8 +308,57 @@ pub(crate) fn ml_kem_public_blob(spki: &SubjectPublicKeyInfoOwned) -> Option<(Ml
     }
     Some((
         set,
-        pq_public_blob(MLKEM_PUBLIC_MAGIC, set.parameter_set(), key)?,
+        pq_key_blob(MLKEM_PUBLIC_MAGIC, set.parameter_set(), key)?,
     ))
+}
+
+/// The blob an ML-KEM private key imports as: `BCRYPT_MLKEM_PRIVATE_SEED_BLOB` or
+/// `BCRYPT_MLKEM_PRIVATE_BLOB`.
+#[cfg(feature = "cms")]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum MlKemPrivateBlob {
+    /// A `BCRYPT_MLKEM_KEY_BLOB` with the seed, from which CNG expands the key.
+    Seed,
+    /// A `BCRYPT_MLKEM_KEY_BLOB` with the expanded decapsulation key.
+    Expanded,
+}
+
+/// Builds the `BCRYPT_MLKEM_KEY_BLOB` for an ML-KEM private key of the parameter set `set`, in one
+/// of RFC 9935's three forms: the seed where the key has one, which CNG expands, otherwise the
+/// expanded decapsulation key. The seed or key must be its parameter set's length. CNG's PKCS #8
+/// import does not take an ML-KEM key, so this is how one reaches the Software Key Storage
+/// Provider.
+#[cfg(feature = "cms")]
+pub(crate) fn ml_kem_private_blob(
+    set: MlKem,
+    key: &certval_cms::SeedOrExpandedKey,
+) -> Option<(MlKemPrivateBlob, zeroize::Zeroizing<Vec<u8>>)> {
+    use certval_cms::SeedOrExpandedKey;
+    let (kind, magic, bytes, len) = match key {
+        SeedOrExpandedKey::Seed(seed) => (
+            MlKemPrivateBlob::Seed,
+            MLKEM_PRIVATE_SEED_MAGIC,
+            seed.as_bytes(),
+            MlKem::SEED_LEN,
+        ),
+        SeedOrExpandedKey::Both(both) => (
+            MlKemPrivateBlob::Seed,
+            MLKEM_PRIVATE_SEED_MAGIC,
+            both.seed.as_bytes(),
+            MlKem::SEED_LEN,
+        ),
+        SeedOrExpandedKey::ExpandedKey(expanded) => (
+            MlKemPrivateBlob::Expanded,
+            MLKEM_PRIVATE_MAGIC,
+            expanded.as_bytes(),
+            set.private_key_len(),
+        ),
+    };
+    if bytes.len() != len {
+        return None;
+    }
+    let blob = pq_key_blob(magic, set.parameter_set(), bytes)?;
+    Some((kind, zeroize::Zeroizing::new(blob)))
 }
 
 /// Builds a `BCRYPT_PQDSA_PUBLIC_BLOB` for an ML-DSA `spki`, together with its parameter set: a
@@ -318,7 +373,7 @@ pub(crate) fn ml_dsa_public_blob(spki: &SubjectPublicKeyInfoOwned) -> Option<(Ml
     }
     Some((
         set,
-        pq_public_blob(MLDSA_PUBLIC_MAGIC, set.parameter_set(), key)?,
+        pq_key_blob(MLDSA_PUBLIC_MAGIC, set.parameter_set(), key)?,
     ))
 }
 
@@ -629,6 +684,44 @@ mod tests {
             let mut with_parameters = spki;
             with_parameters.algorithm.parameters = Some(Any::null());
             assert!(ml_kem_public_blob(&with_parameters).is_none());
+        }
+    }
+
+    #[cfg(feature = "cms")]
+    #[test]
+    fn ml_kem_private_blob_takes_the_seed_where_there_is_one() {
+        use certval_cms::{SeedAndExpandedKey, SeedOrExpandedKey};
+        use der::asn1::OctetString;
+        for set in [MlKem::MlKem512, MlKem::MlKem768, MlKem::MlKem1024] {
+            let seed = OctetString::new(vec![0x5a; 64]).unwrap();
+            let expanded = OctetString::new(vec![0xa5; set.private_key_len()]).unwrap();
+            let name_len = 2 * (set.parameter_set().len() + 1);
+            for key in [
+                SeedOrExpandedKey::Seed(seed.clone()),
+                SeedOrExpandedKey::Both(SeedAndExpandedKey {
+                    seed: seed.clone(),
+                    expanded_key: expanded.clone(),
+                }),
+            ] {
+                let (kind, blob) = ml_kem_private_blob(set, &key).unwrap();
+                assert_eq!(kind, MlKemPrivateBlob::Seed);
+                assert_eq!(le(&blob, 0), MLKEM_PRIVATE_SEED_MAGIC);
+                assert_eq!(le(&blob, 1) as usize, name_len);
+                assert_eq!(le(&blob, 2), 64);
+                assert_eq!(&blob[12 + name_len..], seed.as_bytes());
+            }
+            let (kind, blob) =
+                ml_kem_private_blob(set, &SeedOrExpandedKey::ExpandedKey(expanded.clone()))
+                    .unwrap();
+            assert_eq!(kind, MlKemPrivateBlob::Expanded);
+            assert_eq!(le(&blob, 0), MLKEM_PRIVATE_MAGIC);
+            assert_eq!(le(&blob, 2) as usize, set.private_key_len());
+            assert_eq!(&blob[12 + name_len..], expanded.as_bytes());
+            // A seed or key of another length is refused.
+            let short = OctetString::new(vec![0; 63]).unwrap();
+            assert!(ml_kem_private_blob(set, &SeedOrExpandedKey::Seed(short)).is_none());
+            let other = OctetString::new(vec![0; 1632 + 1]).unwrap();
+            assert!(ml_kem_private_blob(set, &SeedOrExpandedKey::ExpandedKey(other)).is_none());
         }
     }
 

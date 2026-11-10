@@ -20,7 +20,9 @@ certval-cms's `EncryptKem` entirely in CNG: `BCryptEncapsulate`, CNG's HKDF and 
 `CngRecipientKey` decrypts, decapsulating with `NCryptDecapsulate`, and certval-cms's
 `cek_from_kem_secret` derives the key-encryption key and unwraps. Both entry points are looked up
 at run time, since older Windows' bcrypt.dll and ncrypt.dll lack them;
-`CngCrypto::ml_kem_available()` reports whether CNG has them.
+`CngCrypto::ml_kem_available()` reports whether CNG has them. `import_pkcs8` takes an ML-KEM key in
+any of RFC 9935's three forms into the Software Key Storage Provider as CNG's seed or
+decapsulation-key blob, since the provider's PKCS #8 import does not take one.
 
 ## [0.1.0-rc.1]
 

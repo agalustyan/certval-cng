@@ -179,6 +179,16 @@ pub(crate) fn import_ml_kem(blob: &[u8]) -> Option<Key> {
     import(MLKEM_ALG_HANDLE, MLKEM_PUBLIC_BLOB, blob)
 }
 
+/// The blob type an ML-KEM private key imports as: `BCRYPT_MLKEM_PRIVATE_SEED_BLOB` or
+/// `BCRYPT_MLKEM_PRIVATE_BLOB`.
+#[cfg(feature = "cms")]
+pub(crate) fn ml_kem_private_blob_type(kind: crate::blob::MlKemPrivateBlob) -> PCWSTR {
+    match kind {
+        crate::blob::MlKemPrivateBlob::Seed => w!("MLKEMPRIVATESEEDBLOB"),
+        crate::blob::MlKemPrivateBlob::Expanded => w!("MLKEMPRIVATEBLOB"),
+    }
+}
+
 /// `name` from the system library `dll`, or `None` where it does not export it.
 ///
 /// # Safety

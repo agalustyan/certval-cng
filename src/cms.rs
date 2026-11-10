@@ -52,12 +52,12 @@ use zeroize::Zeroizing;
 
 use crate::algorithm::{signature_scheme, Hash, MlDsa, MlKem, Padding};
 use crate::blob::{
-    ecc_public_blob, ecc_spki_from_blob, ml_dsa_spki_from_blob, ml_kem_public_blob,
-    rsa_public_blob, rsa_spki_from_blob, Curve,
+    ecc_public_blob, ecc_spki_from_blob, ml_dsa_spki_from_blob, ml_kem_private_blob,
+    ml_kem_public_blob, rsa_public_blob, rsa_spki_from_blob, Curve,
 };
 use crate::cng::{
-    bcrypt_encapsulate, hash_name, import_ml_kem, import_rsa, ncrypt_decapsulate, PqdsaPaddingInfo,
-    PAD_PQDSA, PQDSA_PUBLIC_BLOB,
+    bcrypt_encapsulate, hash_name, import_ml_kem, import_rsa, ml_kem_private_blob_type,
+    ncrypt_decapsulate, PqdsaPaddingInfo, PAD_PQDSA, PQDSA_PUBLIC_BLOB,
 };
 use crate::CngCrypto;
 
@@ -1443,7 +1443,9 @@ impl SigningCredentialSource for CertStoreIdentities {
 }
 
 /// Credentials for a key imported into the Microsoft Software Key Storage Provider from PKCS #8,
-/// e.g. for testing, or for a key held in software that should be used through CNG.
+/// e.g. for testing, or for a key held in software that should be used through CNG. An ML-KEM
+/// key, whose PKCS #8 form the provider does not import, goes in as CNG's own seed or
+/// decapsulation-key blob, in whichever of RFC 9935's forms the PKCS #8 holds it.
 pub fn import_pkcs8(
     certificate: Certificate,
     pkcs8: &[u8],
@@ -1462,21 +1464,47 @@ pub fn import_pkcs8(
 /// where this Windows' CNG offers it, into the Microsoft Software Key Storage Provider, as a key
 /// with no certificate, e.g. to sign its own certificate request. The key is not persisted. CNG
 /// derives the public key from the private one, so an EC key need not carry its public key. A key
-/// of another type is declined.
+/// of another type, including ML-KEM, which cannot sign, is declined.
 pub fn import_pkcs8_key(pkcs8: &[u8]) -> Result<CngKey> {
     CngKey::new(import_into_software_ksp(pkcs8)?)
 }
 
 /// Imports `pkcs8` into the Microsoft Software Key Storage Provider, as an unnamed key that is not
-/// persisted.
+/// persisted: as PKCS #8, which the provider finalizes after import, except an ML-KEM key, which
+/// the provider's PKCS #8 import does not take and so goes in as CNG's own seed or
+/// decapsulation-key blob (`BCRYPT_MLKEM_KEY_BLOB`), as .NET's ML-KEM does.
 fn import_into_software_ksp(pkcs8: &[u8]) -> Result<NcryptKey> {
+    use certval_cms::SeedOrExpandedKey;
+    use pkcs8::PrivateKeyInfoRef;
     use windows_sys::Win32::Security::Cryptography::{
         NCryptFinalizeKey, NCryptOpenStorageProvider, MS_KEY_STORAGE_PROVIDER,
         NCRYPT_DO_NOT_FINALIZE_FLAG, NCRYPT_PKCS8_PRIVATE_KEY_BLOB,
     };
+    let info = PrivateKeyInfoRef::from_der(pkcs8)?;
+    let ml_kem_blob;
+    let (blob_type, blob, flags): (PCWSTR, &[u8], u32) = match MlKem::from_oid(&info.algorithm.oid)
+    {
+        Some(set) => {
+            let key = SeedOrExpandedKey::from_der(info.private_key.as_bytes())?;
+            let (kind, blob) = ml_kem_private_blob(set, &key).ok_or_else(|| {
+                Error::InvalidInput(String::from(
+                    "an ML-KEM private key is not its parameter set's length",
+                ))
+            })?;
+            ml_kem_blob = blob;
+            (ml_kem_private_blob_type(kind), &ml_kem_blob, 0)
+        }
+        None => (
+            NCRYPT_PKCS8_PRIVATE_KEY_BLOB,
+            pkcs8,
+            NCRYPT_DO_NOT_FINALIZE_FLAG,
+        ),
+    };
+    let finalize = flags == NCRYPT_DO_NOT_FINALIZE_FLAG;
     let mut provider: NCRYPT_PROV_HANDLE = 0;
     let mut key: NCRYPT_KEY_HANDLE = 0;
-    // SAFETY: the provider is freed below; the key is owned by the returned NcryptKey.
+    // SAFETY: the provider is freed below; the key is owned by the returned NcryptKey; the blob is
+    // live with the length passed.
     let status = unsafe {
         let status = NCryptOpenStorageProvider(&mut provider, MS_KEY_STORAGE_PROVIDER, 0);
         if !succeeded(status) {
@@ -1485,15 +1513,15 @@ fn import_into_software_ksp(pkcs8: &[u8]) -> Result<NcryptKey> {
             let status = NCryptImportKey(
                 provider,
                 0,
-                NCRYPT_PKCS8_PRIVATE_KEY_BLOB,
+                blob_type,
                 std::ptr::null(),
                 &mut key,
-                pkcs8.as_ptr(),
-                len32(pkcs8)?,
-                NCRYPT_DO_NOT_FINALIZE_FLAG,
+                blob.as_ptr(),
+                len32(blob)?,
+                flags,
             );
             NCryptFreeObject(provider);
-            if succeeded(status) {
+            if succeeded(status) && finalize {
                 NCryptFinalizeKey(key, 0)
             } else {
                 status

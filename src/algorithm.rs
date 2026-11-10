@@ -132,8 +132,21 @@ impl MlKem {
         }
     }
 
+    /// The size in octets of a decapsulation key (FIPS 203, table 3).
+    pub(crate) fn private_key_len(self) -> usize {
+        match self {
+            MlKem::MlKem512 => 1632,
+            MlKem::MlKem768 => 2400,
+            MlKem::MlKem1024 => 3168,
+        }
+    }
+
     /// The size in octets of the shared secret, the same for every parameter set (FIPS 203).
     pub(crate) const SHARED_SECRET_LEN: usize = 32;
+
+    /// The size in octets of the seed `d ‖ z` a key pair is generated from, the same for every
+    /// parameter set (FIPS 203).
+    pub(crate) const SEED_LEN: usize = 64;
 }
 
 /// A hash CNG provides. SHA-224 is absent because CNG has no SHA-224 provider, so SHA-224
@@ -342,14 +355,22 @@ mod tests {
 
     #[test]
     fn ml_kem_parameter_sets() {
-        for (oid, set, name, public_key_len, ciphertext_len) in [
-            (ID_ALG_ML_KEM_512, MlKem::MlKem512, "512", 800, 768),
-            (ID_ALG_ML_KEM_768, MlKem::MlKem768, "768", 1184, 1088),
-            (ID_ALG_ML_KEM_1024, MlKem::MlKem1024, "1024", 1568, 1568),
+        for (oid, set, name, public_key_len, private_key_len, ciphertext_len) in [
+            (ID_ALG_ML_KEM_512, MlKem::MlKem512, "512", 800, 1632, 768),
+            (ID_ALG_ML_KEM_768, MlKem::MlKem768, "768", 1184, 2400, 1088),
+            (
+                ID_ALG_ML_KEM_1024,
+                MlKem::MlKem1024,
+                "1024",
+                1568,
+                3168,
+                1568,
+            ),
         ] {
             assert_eq!(MlKem::from_oid(&oid), Some(set));
             assert_eq!(set.parameter_set(), name);
             assert_eq!(set.public_key_len(), public_key_len);
+            assert_eq!(set.private_key_len(), private_key_len);
             assert_eq!(set.ciphertext_len(), ciphertext_len);
         }
         assert!(MlKem::from_oid(&ID_ML_DSA_65).is_none());
